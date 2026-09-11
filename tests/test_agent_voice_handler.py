@@ -463,8 +463,8 @@ def test_stt_language_defaults_to_english(monkeypatch, language, expected):
 @pytest.mark.parametrize(
     "reply,expected",
     [
-        ("- item one\n- item two", "item one item two"),
-        ("1. First\n2. Second", "First Second"),
+        ("- item one\n- item two", "item one, item two"),
+        ("1. First\n2. Second", "First, Second"),
         ("# First\n## Second", "First Second"),
         ("😊✅", None),
     ],
@@ -479,10 +479,10 @@ async def test_handler_normalizes_multiline_and_empty_replies(reply, expected):
     await handler.handle_final_transcript("Question")
     assert tts.calls == ([expected] if expected else [])
     outputs = _drain(handler)
-    assert "speech output is having trouble" not in repr(outputs)
+    assert not any("having trouble" in message["content"] for message in _messages(outputs))
     if expected is None:
         assert not any(isinstance(output, tuple) for output in outputs)
-        assert await handler._speak_sentence(reply) is True
+        assert await handler._speak_sentence(reply) is False
 
 
 @pytest.mark.asyncio
@@ -529,3 +529,39 @@ async def test_handler_pipeline_events_and_log_privacy(monkeypatch, caplog, log_
     assert ("Private question" in caplog.text) is log_content
     assert ("Private answer." in caplog.text) is log_content
     assert "test-model" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chunks,failed,warning",
+    [
+        (["Done."], True, True),
+        (["Done.", "✅"], True, True),
+        (["Done. ✅"], True, True),
+        (["✅"], True, False),
+        (["✅"], False, False),
+    ],
+)
+async def test_empty_chunks_do_not_mask_tts_failures(monkeypatch, chunks, failed, warning):
+    monkeypatch.setenv("AGENT_QUICKTAKE_ENABLED", "0")
+    client = FakeTextAgentClient(reply="unused")
+
+    async def stream(text):
+        for chunk in chunks:
+            yield chunk
+
+    monkeypatch.setattr(client, "ask_stream", stream, raising=False)
+    tts = _FailingTtsClient() if failed else FakeAudioTtsClient(24000, np.array([1], dtype=np.int16))
+    handler = AgentVoiceHandler(
+        ToolDependencies(reachy_mini=object(), movement_manager=_FakeMovementManager()),
+        agent_client=client,
+        tts_client=tts,
+    )
+    await handler.handle_final_transcript("Question")
+    outputs = _drain(handler)
+    messages = _messages(outputs)
+    assert any("speech output is having trouble" in message["content"] for message in messages) is warning
+    if chunks == ["✅"]:
+        assert not any(isinstance(output, tuple) for output in outputs)
+        if not failed:
+            assert tts.calls == []

@@ -1522,7 +1522,12 @@ class AgentVoiceHandler(ConversationHandler):
                 if parts:
                     self.output_queue.put_nowait(AdditionalOutputs({"role": "assistant", "content": " ".join(parts)}))
                     self._maybe_turn_emote(clean_transcript, " ".join(parts))
-                if parts and not spoke_any and not committed:
+                if (
+                    parts
+                    and not spoke_any
+                    and not committed
+                    and any(_text_for_speech(normalize_for_speech(part)) for part in parts)
+                ):
                     self.output_queue.put_nowait(
                         AdditionalOutputs(
                             {
@@ -1584,7 +1589,7 @@ class AgentVoiceHandler(ConversationHandler):
 
         Streaming (response_format=pcm) yields the first audio ~176ms after the request vs waiting for the
         whole-sentence WAV; pacing + segmenting keeps the GStreamer appsrc queue small (a whole blob overflows
-        max-bytes). Falls back to the full-WAV synthesize() if the client can't stream. Returns True if audio was queued or normalization leaves nothing to say.
+        max-bytes). Falls back to the full-WAV synthesize() if the client can't stream. Returns True only if audio was queued.
         """
         thinking_cue = getattr(self, "_thinking_cue", None)
         if thinking_cue is not None:
@@ -1592,7 +1597,7 @@ class AgentVoiceHandler(ConversationHandler):
         text = _text_for_speech(normalize_for_speech(text))
         if not text:
             logger.debug("Skipping empty normalized TTS content")
-            return True
+            return False
         segment_seconds = min(1.0, max(0.02, self._float_env("AGENT_PLAYBACK_SEGMENT_S", 0.5)))
         if self._pipeline_monitor is not None:
             # Report what the TTS client will actually send (bounded speed, live set_voice changes).
