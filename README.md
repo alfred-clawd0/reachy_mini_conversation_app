@@ -499,7 +499,9 @@ The quiet settings in `.env.example` are commented suggestions, not active defau
 to `1`; `AGENT_GAP_FILL_MAX` defaults to `2`. Set all four to `0` for answer-only speech.
 The motion switches listed above also default to `1`.
 
-Deploy this client together with the hermes-reachy authentication adapter update. Configure
+Deploy this client together with the [hermes-reachy authentication adapter](https://github.com/alfred-clawd0/hermes-reachy) update.
+The repository home is [alfred-clawd0/reachy_mini_conversation_app](https://github.com/alfred-clawd0/reachy_mini_conversation_app);
+stack configuration lives in [reachy-hermes-stack](https://github.com/alfred-clawd0/reachy-hermes-stack). Configure
 `AGENT_PLATFORM_API_KEY_FILE` with an absolute path; its stripped contents must equal the
 secret in the gateway's `REACHY_WS_API_KEY_FILE`. Missing, empty, unreadable, or rejected keys
 are rechecked after 60 seconds, with retries doubling to a 900-second maximum. Replacing the
@@ -508,7 +510,9 @@ connection (4001, or 1000 with a superseded reason) stops reconnecting: check fo
 app using the same robot ID before restarting. Ordinary gateway shutdowns still reconnect.
 Use `wss://` for a non-loopback gateway; plain `ws://` sends the key unencrypted and produces a warning.
 
-The app's local prompts and STT default to English. The pinned runtime still has German vision
-and semantic-gate prompts; updating that pin awaits the decision about the runtime repository home.
+The app and the pinned [English runtime](https://github.com/alfred-clawd0/reachy-hermes-agent/commit/66128b60d7bcda1f3a6af8700686fc825bb92d32)
+default to English, including scene/VLM prompts, fallbacks, and semantic-gate prompts. English
+bare stops such as "no", "wait", and "shh" are handled alongside German stops. The runtime
+uses only its `[voice]` extra here; update the pin to the fork's main merge commit after its PR merges.
 An explicit adapter `hello_ok` acknowledgement is also deferred; currently an inbound application
 frame resets the authentication retry streak.

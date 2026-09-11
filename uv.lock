@@ -2323,7 +2323,7 @@ wheels = [
 [[package]]
 name = "reachy-hermes-agent"
 version = "0.1.0"
-source = { git = "https://github.com/ai-ag2026/reachy-hermes-agent?rev=255c7dc1e271245cdad280bf65099c33f013d0aa#255c7dc1e271245cdad280bf65099c33f013d0aa" }
+source = { git = "https://github.com/alfred-clawd0/reachy-hermes-agent?rev=66128b60d7bcda1f3a6af8700686fc825bb92d32#66128b60d7bcda1f3a6af8700686fc825bb92d32" }
 dependencies = [
     { name = "httpx" },
     { name = "numpy" },
@@ -2460,7 +2460,7 @@ requires-dist = [
     { name = "opencv-python", marker = "extra == 'all-vision'", specifier = ">=4.13.0.92" },
     { name = "opencv-python", marker = "extra == 'yolo-vision'", specifier = ">=4.13.0.92" },
     { name = "python-dotenv" },
-    { name = "reachy-hermes-agent", extras = ["voice"], marker = "extra == 'voice'", git = "https://github.com/ai-ag2026/reachy-hermes-agent?rev=255c7dc1e271245cdad280bf65099c33f013d0aa" },
+    { name = "reachy-hermes-agent", extras = ["voice"], marker = "extra == 'voice'", git = "https://github.com/alfred-clawd0/reachy-hermes-agent?rev=66128b60d7bcda1f3a6af8700686fc825bb92d32" },
     { name = "reachy-mini", extras = ["mujoco"], specifier = ">=1.10.0,<1.11" },
     { name = "reachy-mini-dances-library" },
     { name = "reachy-mini-toolbox" },

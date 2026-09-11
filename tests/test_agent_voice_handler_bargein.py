@@ -85,10 +85,11 @@ async def test_backchannel_is_ignored_agent_keeps_talking() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bare_stop_stops_without_forward() -> None:
+@pytest.mark.parametrize("stop_text", ["stopp", "stop", "no", "wait", "shh"])
+async def test_bare_stop_stops_without_forward(stop_text) -> None:
     box: dict = {}
     agent = _StreamAgentClient(["Satz eins.", "Satz zwei.", "Satz drei."])
-    tts = _ActingTtsClient(box, act_on_call=0, transcript="stopp")  # heuristic -> stop
+    tts = _ActingTtsClient(box, act_on_call=0, transcript=stop_text)  # heuristic -> stop
     handler = _make_handler(agent, tts)
     box["h"] = handler
     handler._turn_active = True  # receive() sets this before scheduling the turn
@@ -156,12 +157,13 @@ async def test_classify_dispatches_platform_interrupt_immediately(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_classify_bare_stop_dispatches_slash_stop(monkeypatch) -> None:
+@pytest.mark.parametrize("stop_text", ["stopp", "stop", "no", "wait", "shh"])
+async def test_classify_bare_stop_dispatches_slash_stop(monkeypatch, stop_text) -> None:
     client = _PlatformishClient([])
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
     handler._turn_active = True
 
-    await handler._classify_and_act("stopp")  # heuristic bare stop
+    await handler._classify_and_act(stop_text)  # runtime heuristic, no LLM mock
 
     assert client.interrupts == [None]  # forwarded as bare /stop by the client
     assert handler._barge_event.is_set() is False
@@ -207,13 +209,14 @@ async def test_silent_phase_commit_is_deferred_and_fires_at_first_audio(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_silent_phase_bare_stop_lets_turn_deliver(monkeypatch) -> None:
+@pytest.mark.parametrize("stop_text", ["stopp", "stop", "no", "wait", "shh"])
+async def test_silent_phase_bare_stop_lets_turn_deliver(monkeypatch, stop_text) -> None:
     client = _PlatformishClient([])
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
     handler._turn_active = True
     handler._turn_spoke = False
 
-    await handler._classify_and_act("stopp", my_seq=handler._turn_seq, silent_phase=True)
+    await handler._classify_and_act(stop_text, my_seq=handler._turn_seq, silent_phase=True)
 
     # nothing audible to stop -> no cancel (no-answer-loop protection), nothing forwarded
     assert handler._pending_barge is None
