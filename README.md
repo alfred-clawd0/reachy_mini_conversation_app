@@ -500,11 +500,16 @@ to `1`; `AGENT_GAP_FILL_MAX` defaults to `2`. Set all four to `0` for answer-onl
 The motion switches listed above also default to `1`.
 
 Shutdown commands sleep only if this app successfully enabled the motors, and disables
-them only after a sleep move completes successfully, including in daemon-hosted runs.
+them only after a sleep move completes successfully and the measured head pose is within
+10 SDK magic-mm of the sleep pose, including in daemon-hosted runs. A failed pose read
+or a head outside that radius leaves torque enabled with a warning.
 Setup failures before motor enable release resources without sleeping or cutting torque.
-Sleep is tried twice, 0.5 seconds apart; if both attempts fail or time out, torque stays enabled to avoid a head drop, and the client disconnects. Camera or
+Sleep is tried twice, 0.5 seconds apart; if both attempts fail or time out, torque stays
+enabled to avoid a head drop, and the client disconnects. Camera or
 movement-worker cleanup failures do not skip robot cleanup. A second startup wake failure
 uses the same sleep-confirmed cleanup because a timed-out move may still be running.
+A signal during cleanup is absorbed while restoring the previous signal handlers, so a
+subsequent signal can interrupt a hung cleanup.
 Microphone quieting happens while listening (breathing is cancelled). Use the motion
 switches in the configuration table (`AGENT_IDLE_BREATHING`, `AGENT_IDLE_ACTIONS`,
 `AGENT_SPEECH_SWAY`, and `AGENT_SPEECH_WOBBLE`) and the quiet-motion suggestions in

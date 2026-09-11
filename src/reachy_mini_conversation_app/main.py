@@ -18,6 +18,8 @@ from gradio.utils import get_space
 
 from reachy_mini import ReachyMini, ReachyMiniApp
 from reachy_mini.io.protocol import SetVolumeCmd
+from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
+from reachy_mini.utils.interpolation import distance_between_poses
 from reachy_mini_conversation_app.utils import (
     CameraVisionInitializationError,
     parse_args,
@@ -25,6 +27,11 @@ from reachy_mini_conversation_app.utils import (
     initialize_camera_and_vision,
     log_connection_troubleshooting,
 )
+
+
+# Mirror SDK 1.10 Backend.SLEEP_POSE_MAGIC_ATOL and app manager
+# SLEEP_POSE_MAGIC_DISTANCE: translation mm + rotation degrees ("magic-mm").
+_SLEEP_POSE_MAX_DISTANCE = 10.0
 
 
 def update_chatbot(chatbot: List[Dict[str, Any]], response: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -85,7 +92,7 @@ def run(
     logger.info("Starting Reachy Mini Conversation App")
     if app_stop_event is None:
         app_stop_event = threading.Event()
-    previous_signal_handlers = {}
+    previous_signal_handlers: dict[signal.Signals, Any] = {}
     managed_robot = robot
     motors_enabled_by_app = False
     camera_worker = None
@@ -130,11 +137,23 @@ def run(
                 except Exception as exc:
                     logger.debug("Error restoring speaker volume after signal: %s", exc)
             if sleep_ok:
+                pose_ok = False
                 try:
-                    managed_robot.disable_motors()
-                    logger.info("Reachy motors disabled after completed sleep move")
+                    _, _, distance = distance_between_poses(managed_robot.get_current_head_pose(), SLEEP_HEAD_POSE)
+                    pose_ok = bool(distance <= _SLEEP_POSE_MAX_DISTANCE)
+                    if not pose_ok:
+                        logger.warning(
+                            "head not at sleep pose after sleep move (distance %.2f); leaving motors enabled",
+                            distance,
+                        )
                 except Exception as exc:
-                    logger.error("Could not disable Reachy motors during shutdown: %s", type(exc).__name__)
+                    logger.warning("could not verify head sleep pose (%s); leaving motors enabled", type(exc).__name__)
+                if pose_ok:
+                    try:
+                        managed_robot.disable_motors()
+                        logger.info("Reachy motors disabled after completed and measured sleep move")
+                    except Exception as exc:
+                        logger.error("Could not disable Reachy motors during shutdown: %s", type(exc).__name__)
             elif motors_enabled_by_app:
                 logger.warning("sleep move did not complete; leaving motors enabled to avoid a head drop")
             try:
@@ -156,7 +175,9 @@ def run(
         # Reentrancy guard: the cleanup blocks for seconds (movement stop + sleep pose); a second
         # SIGTERM re-entering mid-cleanup would abort the first pass half-way (audit 2026-07-02).
         if _shutdown_signal_seen.is_set() or _runtime_cleaned.is_set():
-            logger.info("Received signal %s during shutdown — already cleaning up", signum)
+            logger.info("Received signal %s during shutdown — restoring handlers for escalation", signum)
+            for sig, previous_handler in previous_signal_handlers.items():
+                signal.signal(sig, previous_handler)
             return
         _shutdown_signal_seen.set()
         logger.info("Received signal %s, shutting down gracefully", signum)

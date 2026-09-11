@@ -22,6 +22,7 @@ def runtime(monkeypatch):
     handlers = {}
     delays = []
     robot = MagicMock()
+    robot.get_current_head_pose.return_value = main.SLEEP_HEAD_POSE.copy()
     camera = MagicMock()
     movement = MagicMock()
     stream = MagicMock()
@@ -64,6 +65,7 @@ def runtime(monkeypatch):
         stream=stream,
         events=events,
         handlers=handlers,
+        previous_handlers=previous_handlers,
         delays=delays,
     )
 
@@ -183,7 +185,13 @@ def test_setup_failure_preserves_motor_ownership(runtime, monkeypatch, caplog, s
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
 def test_first_signal_during_normal_cleanup_does_not_interrupt(runtime, signum):
     """A signal arriving in finally lets that cleanup finish and restore handlers."""
-    runtime.robot.goto_sleep.side_effect = lambda: runtime.handlers[signum](signum, None)
+
+    def sleep():
+        runtime.handlers[signum](signum, None)
+        # Check during cleanup, before run()'s finally could restore them.
+        assert runtime.handlers == runtime.previous_handlers
+
+    runtime.robot.goto_sleep.side_effect = sleep
     runtime.run()
     runtime.robot.goto_sleep.assert_called_once()
     runtime.robot.disable_motors.assert_called_once()
@@ -216,3 +224,33 @@ def test_enable_failure_only_claims_motors_after_success(runtime, caplog, failur
     runtime.robot.media.close.assert_called_once()
     runtime.robot.client.disconnect.assert_called_once()
     assert "leaving motors enabled" not in caplog.text
+
+
+@pytest.mark.parametrize("pose_state", ["near", "far", "unreadable"])
+def test_shutdown_checks_measured_pose_before_torque_cut(runtime, caplog, pose_state):
+    """A completed move alone cannot prove that the head actually reached sleep."""
+    _sleep_outcomes(runtime, 0)
+    pose = main.SLEEP_HEAD_POSE.copy()
+    pose[0, 3] += 0.005 if pose_state == "near" else 0.05
+
+    def read_pose():
+        runtime.events.append("pose_read")
+        if pose_state == "unreadable":
+            raise RuntimeError("private pose details")
+        return pose
+
+    runtime.robot.get_current_head_pose.side_effect = read_pose
+    runtime.run()
+    runtime.robot.get_current_head_pose.assert_called_once()
+    assert runtime.events.index("sleep_success") < runtime.events.index("pose_read")
+    assert runtime.robot.disable_motors.call_count == int(pose_state == "near")
+    if pose_state == "near":
+        assert runtime.events.index("pose_read") < runtime.events.index("disable")
+        assert runtime.events.index("disable") < runtime.events.index("disconnect")
+        assert "leaving motors enabled" not in caplog.text
+    else:
+        assert caplog.text.count("leaving motors enabled") == 1
+        assert "private pose details" not in caplog.text
+        assert ("distance 50.00" if pose_state == "far" else "RuntimeError") in caplog.text
+    runtime.robot.media.close.assert_called_once()
+    runtime.robot.client.disconnect.assert_called_once()
