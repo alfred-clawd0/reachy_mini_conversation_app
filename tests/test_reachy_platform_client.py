@@ -613,7 +613,7 @@ def test_concurrent_ensure_session_connects_once(monkeypatch):
     async def go():
         c = ReachyPlatformClient()
 
-        async def fake_connect(url):
+        async def fake_connect(url, **kwargs):
             connects["n"] += 1
             await asyncio.sleep(0.05)  # window in which the second caller would race in
             return _OneWS()
@@ -685,7 +685,7 @@ def test_auth_rejection_retries_and_recovers(monkeypatch, tmp_path, caplog, reje
 
     caplog.set_level(logging.DEBUG)
     now = [1000.0]
-    monkeypatch.setattr(platform.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(platform, "_monotonic", lambda: now[0])
     key_file = tmp_path / "key"
     key_file.write_text("secret-echo")
     monkeypatch.delenv("AGENT_PLATFORM_API_KEY", raising=False)
@@ -702,7 +702,7 @@ def test_auth_rejection_retries_and_recovers(monkeypatch, tmp_path, caplog, reje
         async def __anext__(self):
             raise rejection
 
-    async def connect(url):
+    async def connect(url, **kwargs):
         ws = FakeWS([_f(type="typing")]) if key_file.read_text() == "rotated-key" else RejectedWS([])
         sockets.append(ws)
         return ws
@@ -766,7 +766,7 @@ def test_reader_close_superseded_or_normal(monkeypatch, caplog, code, reason, ra
                 raise ConnectionClosedError(Close(code, reason), None)
             raise StopAsyncIteration
 
-    async def connect(url):
+    async def connect(url, **kwargs):
         ws = ClosedWS([])
         sockets.append(ws)
         return ws
@@ -810,10 +810,10 @@ def test_missing_empty_or_invalid_key_waits_for_rotation(monkeypatch, tmp_path, 
     monkeypatch.delenv("AGENT_PLATFORM_API_KEY", raising=False)
     monkeypatch.setenv("AGENT_PLATFORM_API_KEY_FILE", str(key_file))
     now = [1000.0]
-    monkeypatch.setattr(platform.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(platform, "_monotonic", lambda: now[0])
     sockets = []
 
-    async def connect(url):
+    async def connect(url, **kwargs):
         sockets.append(FakeWS([]))
         return sockets[-1]
 
@@ -863,3 +863,201 @@ def test_plaintext_remote_warning(monkeypatch, caplog, url, warn):
     config = ReachyPlatformConfig()
     config.reload_api_key()
     assert caplog.text.count("plaintext") == int(warn)
+
+
+@pytest.mark.asyncio
+async def test_protocol_logger_hides_real_frames_after_reconfiguration(monkeypatch, caplog):
+    """Root DEBUG and dictConfig must never expose hello keys or peer close reasons."""
+    import logging.config
+
+    from websockets.asyncio.server import serve
+
+    from reachy_mini_conversation_app import reachy_platform_client as platform
+
+    key = "private-protocol-key-718"
+    monkeypatch.setenv("AGENT_PLATFORM_API_KEY", key)
+    caplog.set_level(logging.DEBUG)
+    root = logging.getLogger()
+    parent = logging.getLogger("reachy_mini_conversation_app")
+    old_handlers, old_level, parent_level = list(root.handlers), root.level, parent.level
+    hello_seen, reject = asyncio.Event(), asyncio.Event()
+
+    async def server_handler(ws):
+        hello = json.loads(await ws.recv())
+        assert hello["api_key"] == key
+        hello_seen.set()
+        await reject.wait()
+        await ws.close(code=1008, reason=key)
+
+    # Server logging is isolated; this regression exercises the client's protocol logger.
+    server_logger = logging.Logger("isolated-test-server", level=logging.WARNING)
+    async with serve(server_handler, "127.0.0.1", 0, logger=server_logger) as server:
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setenv("AGENT_PLATFORM_WS_URL", f"ws://127.0.0.1:{port}")
+        client = ReachyPlatformClient()
+        try:
+            await client._ensure_session()
+            await asyncio.wait_for(hello_seen.wait(), 2)
+            logging.config.dictConfig(
+                {
+                    "version": 1,
+                    "disable_existing_loggers": False,
+                    "root": {"level": "DEBUG", "handlers": []},
+                    "loggers": {"reachy_mini_conversation_app": {"level": "DEBUG"}},
+                }
+            )
+            root.addHandler(caplog.handler)
+            assert not platform._protocol_logger.isEnabledFor(logging.DEBUG)
+            platform._protocol_logger.debug("hidden %s", key)
+            platform._protocol_logger.log(logging.DEBUG, "hidden %s", key)
+            reject.set()
+            await asyncio.wait_for(client._reader_task, 2)
+            assert client._auth_rejected
+        finally:
+            reject.set()
+            await client.aclose()
+            root.handlers = old_handlers
+            root.setLevel(old_level)
+            parent.setLevel(parent_level)
+    assert "authentication rejected" in caplog.text
+    assert all(key not in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_auth_history_does_not_hide_unrelated_errors(monkeypatch, caplog):
+    """Current transport failures keep their actual error even after an auth rejection."""
+    import websockets.asyncio.client as wac
+
+    monkeypatch.setenv("AGENT_PLATFORM_API_KEY", "test-key")
+    caplog.set_level(logging.DEBUG)
+
+    class BrokenWS(FakeWS):
+        async def send(self, message):
+            raise RuntimeError("socket write failed")
+
+        async def __anext__(self):
+            raise RuntimeError("socket read failed")
+
+    async def connect(url, **kwargs):
+        return BrokenWS([])
+
+    monkeypatch.setattr(wac, "connect", connect)
+    client = ReachyPlatformClient()
+    client._auth_rejected = True
+    client._auth_backoff = 240
+    try:
+        assert not client._check_auth_rejection(RuntimeError("unrelated"))
+        with pytest.raises(RuntimeError, match="socket write failed"):
+            await client._ensure_session()
+        assert [text async for text in client.ask_stream("Hello")]
+        client._ws = BrokenWS([])
+        await client._reader()
+        assert "send failed: socket write failed" in caplog.text
+        assert "reader ended: socket read failed" in caplog.text
+        assert "authentication rejected" not in caplog.text
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_quiet_session_resets_auth_streak(monkeypatch, caplog):
+    """A quiet accepted connection resets both the wait and the rejection log streak."""
+    from reachy_mini_conversation_app import reachy_platform_client as platform
+
+    monkeypatch.setattr(platform, "_AUTH_GRACE_S", 0.01)
+    monkeypatch.setattr(platform, "_monotonic", lambda: 1000.0)
+
+    class QuietWS(FakeWS):
+        async def __anext__(self):
+            await asyncio.Event().wait()
+
+    client = ReachyPlatformClient()
+    client._auth_rejected = True
+    client._auth_backoff = 480
+    client._ws = QuietWS([])
+    client._reader_task = asyncio.create_task(client._reader())
+    try:
+        # This timeout uses the real loop clock despite the patched retry clock.
+        await asyncio.wait_for(asyncio.sleep(0.05), 1)
+        assert not client._auth_rejected
+        assert client._auth_backoff == 60
+        assert client._check_close(1008, "")
+        assert client._auth_retry_at == 1060
+        assert "in 60s" in caplog.text
+    finally:
+        await client.aclose()
+
+
+def test_rejection_log_uses_actual_backoff(monkeypatch, caplog):
+    """A first rejection following missing credentials reports the real scheduled wait."""
+    from reachy_mini_conversation_app import reachy_platform_client as platform
+
+    monkeypatch.setattr(platform, "_monotonic", lambda: 1000.0)
+    client = ReachyPlatformClient()
+    client._auth_backoff = 240
+    assert client._check_close(1008, "")
+    assert client._auth_retry_at == 1240
+    assert "in 240s" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stale_reader_does_not_latch_superseded():
+    """Closing an old reader must not disable the replacement session."""
+    from websockets.frames import Close
+    from websockets.exceptions import ConnectionClosedError
+
+    client = ReachyPlatformClient()
+    replacement = FakeWS([])
+
+    class OldWS(FakeWS):
+        close_code = 4001
+        close_reason = "superseded"
+
+        async def __anext__(self):
+            client._ws = replacement
+            raise ConnectionClosedError(Close(4001, "superseded"), None)
+
+    client._ws = OldWS([])
+    try:
+        await client._reader()
+        assert not client._superseded
+        assert client._ws is replacement
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reloads_credentials_on_schedule(monkeypatch, tmp_path):
+    """The supervisor recovers from a missing key without a user turn or real wait."""
+    import websockets.asyncio.client as wac
+
+    from reachy_mini_conversation_app import reachy_platform_client as platform
+
+    now = [1000.0]
+    key_file = tmp_path / "key"
+    monkeypatch.delenv("AGENT_PLATFORM_API_KEY", raising=False)
+    monkeypatch.setenv("AGENT_PLATFORM_API_KEY_FILE", str(key_file))
+    monkeypatch.setattr(platform, "_monotonic", lambda: now[0])
+    connects = []
+    original_sleep = asyncio.sleep
+    client = ReachyPlatformClient()
+
+    async def sleep(delay):
+        now[0] += delay
+        if now[0] >= 1060:
+            key_file.write_text("repaired-key")
+        if connects:
+            client._closed = True
+        await original_sleep(0)
+
+    async def connect(url, **kwargs):
+        connects.append(now[0])
+        return FakeWS([])
+
+    monkeypatch.setattr(platform.asyncio, "sleep", sleep)
+    monkeypatch.setattr(wac, "connect", connect)
+    try:
+        await client._supervise()
+        assert connects == [1060.0]
+    finally:
+        await client.aclose()

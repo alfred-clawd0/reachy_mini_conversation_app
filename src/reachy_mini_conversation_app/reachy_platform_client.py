@@ -52,6 +52,24 @@ from reachy_mini_conversation_app.agent_clients import (
 
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
+_AUTH_GRACE_S = 10.0
+
+
+class _ProtocolLogger(logging.LoggerAdapter[logging.Logger]):
+    """Never expose WebSocket frame payloads, even after logging reconfiguration."""
+
+    def isEnabledFor(self, level: int) -> bool:
+        """Disable protocol DEBUG unconditionally."""
+        return level > logging.DEBUG and super().isEnabledFor(level)
+
+    def log(self, level: int, msg: object, *args: Any, **kwargs: Any) -> None:
+        """Drop DEBUG records before forwarding to the configured logger."""
+        if level > logging.DEBUG:
+            super().log(level, msg, *args, **kwargs)
+
+
+_protocol_logger = _ProtocolLogger(logging.getLogger(__name__ + ".protocol"), {})
 
 # A run of text ending in sentence punctuation or a newline = one complete sentence.
 _SENTENCE_RE = re.compile(r"[^.!?…\n]*(?:[.!?…]+|\n+)", re.S)
@@ -265,8 +283,8 @@ class ReachyPlatformClient:
                 except Exception as e:
                     if self._superseded:
                         return
-                    if self._auth_retry_at > time.monotonic():
-                        await asyncio.sleep(min(1.0, self._auth_retry_at - time.monotonic()))
+                    if self._auth_retry_at > _monotonic():
+                        await asyncio.sleep(min(1.0, self._auth_retry_at - _monotonic()))
                         continue
                     logger.info("[reachy-platform] reconnect failed (%s) — retry in %.0fs", e, backoff)
                     await asyncio.sleep(backoff)
@@ -283,17 +301,19 @@ class ReachyPlatformClient:
         async with self._connect_lock:
             if self._superseded:
                 raise ConnectionError("connection superseded by another app instance")
-            if time.monotonic() < self._auth_retry_at:
+            if _monotonic() < self._auth_retry_at:
                 raise ConnectionError("platform credentials awaiting scheduled retry")
             if self._ws is None:
                 self._auth_retry_at = 0.0
-                self.config.reload_api_key()
+                await asyncio.to_thread(self.config.reload_api_key)
                 if not self.config.api_key:
                     self._schedule_auth_retry()
                     raise ConnectionError("no platform API key configured")
                 from websockets.asyncio.client import connect
 
-                ws = await asyncio.wait_for(connect(self.config.ws_url), timeout=self.config.connect_timeout_s)
+                ws = await asyncio.wait_for(
+                    connect(self.config.ws_url, logger=_protocol_logger), timeout=self.config.connect_timeout_s
+                )
                 try:
                     await ws.send(
                         json.dumps(
@@ -305,14 +325,14 @@ class ReachyPlatformClient:
                         )
                     )
                 except Exception as exc:
-                    self._check_auth_rejection(exc)
+                    policy_close = self._check_auth_rejection(exc)
                     # gateway reset between connect and hello: close instead of leaking the socket
                     try:
                         await ws.close()
                     except Exception:
                         pass
-                    if self._auth_rejected:
-                        raise ConnectionError("authentication rejected") from None
+                    if policy_close:
+                        raise ConnectionError("platform policy close") from None
                     raise
                 self._ws = ws
                 logger.info("[reachy-platform] connected to %s", self.config.ws_url)
@@ -320,8 +340,8 @@ class ReachyPlatformClient:
                 self._reader_task = asyncio.create_task(self._reader())
 
     def _schedule_auth_retry(self) -> None:
-        if self._auth_retry_at <= time.monotonic():
-            self._auth_retry_at = time.monotonic() + self._auth_backoff
+        if self._auth_retry_at <= _monotonic():
+            self._auth_retry_at = _monotonic() + self._auth_backoff
             self._auth_backoff = min(900.0, self._auth_backoff * 2.0)
 
     def _check_close(self, code: int | None, reason: str | None) -> bool:
@@ -336,18 +356,26 @@ class ReachyPlatformClient:
         elif code == 1008:
             if not self._auth_rejected:
                 logger.error(
-                    "[reachy-platform] authentication rejected (1008); retrying credentials in 60s, "
-                    "with exponential backoff up to 900s"
+                    "[reachy-platform] authentication rejected (1008); retrying credentials in %.0fs, "
+                    "with exponential backoff up to 900s",
+                    self._auth_backoff,
                 )
             self._auth_rejected = True
             self._schedule_auth_retry()
-        return self._auth_rejected or self._superseded
+        else:
+            return False
+        return True
 
     def _check_auth_rejection(self, exc: Exception) -> bool:
         """Handle policy closes without logging the peer's potentially sensitive reason."""
         if isinstance(exc, ConnectionClosed) and exc.rcvd is not None:
             return self._check_close(exc.rcvd.code, exc.rcvd.reason)
-        return self._auth_rejected or self._superseded
+        return False
+
+    def _reset_auth_streak(self) -> None:
+        self._auth_rejected = False
+        self._auth_retry_at = 0.0
+        self._auth_backoff = 60.0
 
     def _route(self, frame: dict[str, Any]) -> str:
         """Decide where an inbound frame goes: 'turn' (active interactive turn), 'proactive' (unsolicited delivery), or 'drop' (straggler of a cancelled/older turn).
@@ -373,6 +401,15 @@ class ReachyPlatformClient:
         ws = self._ws
         if ws is None:
             return
+
+        async def confirm_quiet_session() -> None:
+            # The adapter has no hello_ok yet. A socket still open after its hello deadline
+            # is evidence of acceptance, even when no proactive/application traffic arrives.
+            await asyncio.sleep(_AUTH_GRACE_S)
+            if self._ws is ws and getattr(ws, "close_code", None) is None:
+                self._reset_auth_streak()
+
+        auth_grace = asyncio.create_task(confirm_quiet_session())
         prot = _AnswerAccumulator()
         prot_chunks: list[str] = []
         settle_task: asyncio.Task[Any] | None = None
@@ -422,9 +459,8 @@ class ReachyPlatformClient:
                 except Exception:
                     continue
                 # Without hello_ok, an inbound application frame is evidence of acceptance.
-                self._auth_rejected = False
-                self._auth_retry_at = 0.0
-                self._auth_backoff = 60.0
+                self._reset_auth_streak()
+                auth_grace.cancel()
                 if frame.get("type") == "tool_call":
                     # gateway-requested body action — independent of turn routing
                     t = asyncio.create_task(self._run_tool_call(frame))
@@ -456,10 +492,12 @@ class ReachyPlatformClient:
                     _cancel_settle()
                     _flush_proactive()
         except Exception as e:
-            if not self._check_auth_rejection(e):
+            if self._ws is ws and not self._check_auth_rejection(e):
                 logger.info("[reachy-platform] reader ended: %s", e)
         finally:
-            self._check_close(getattr(ws, "close_code", None), getattr(ws, "close_reason", None))
+            auth_grace.cancel()
+            if self._ws is ws:
+                self._check_close(getattr(ws, "close_code", None), getattr(ws, "close_reason", None))
             # unblock any waiting turn and drop the session so the supervisor/next turn
             # reconnects — but only OUR session (a stale reader must not clobber a newer ws).
             if self._turn_q is not None:
