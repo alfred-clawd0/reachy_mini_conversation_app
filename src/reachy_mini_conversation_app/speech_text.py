@@ -8,13 +8,15 @@ _CODE_FENCE_RE = re.compile(r"```(?:[\w+-]+)?\s*(.*?)```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^]]+)]\((?:https?://|mailto:)[^)]+\)")
 _URL_RE = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
-_APPLICATION_BUNDLE_RE = re.compile(r'(?<!\w)/Applications/[^\n`"<>]*?\.app(?=/|[\s.,;:!?)]|$)(?:/\S+)?')
+_APPLICATION_BUNDLE_RE = re.compile(
+    r"(?<!\w)/Applications/(?:[^/\s]+/)*(?:[A-Z0-9][^/\s,;:!?]*\s){0,3}[^/\s,;:!?]*\.app(?=/|[\s.,;:!?)]|$)(?:/\S+)?"
+)
 _ABSOLUTE_PATH_RE = re.compile(r"(?<!\w)/(?:Applications|Users|private|var|tmp)/\S+")
 _REPEAT_COUNTER_RE = re.compile(r"\(\s*[×x]\s*\d+\s*\)", re.IGNORECASE)
 _NUMERIC_RANGE_RE = re.compile(r"(?<=\d)\s*–\s*(?=\d)")
 _LIST_MARKER_RE = re.compile(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+")
 _HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s*")
-_EMPHASIS_RE = re.compile(r"(?<![\w*])(\*{1,3}|__|_)([^\W\d_][^\n*]*?)(?<=\w)\1(?![\w*])")
+_EMPHASIS_RE = re.compile(r"(?<![\w*])(\*{1,3}|__|_)(?![\s*_])([^\n*]+?)(?<![\s*])\1(?![\w*])")
 _SPACE_RE = re.compile(r"\s+")
 
 
