@@ -87,6 +87,7 @@ def run(
         app_stop_event = threading.Event()
     previous_signal_handlers = {}
     managed_robot = robot
+    motors_enabled_by_app = False
     camera_worker = None
     managed_movement_manager = None
     saved_speaker_volume: int | None = None
@@ -107,19 +108,21 @@ def run(
             except Exception as exc:
                 logger.warning("Error stopping movement manager during shutdown: %s", type(exc).__name__)
         if managed_robot is not None:
-            # Only a completed sleep move makes cutting torque safe. A timeout does
-            # not cancel the daemon move, so failed sleep attempts must leave torque on.
+            # Only manage torque after this app enabled position control. Before that,
+            # another owner may have left gravity compensation active (targets ignored).
+            # A sleep timeout does not cancel the daemon move: leave torque on if it fails.
             sleep_ok = False
-            for attempt in range(2):
-                try:
-                    managed_robot.goto_sleep()
-                    sleep_ok = True
-                    logger.info("Reachy reached the sleep pose")
-                    break
-                except Exception as exc:
-                    logger.warning("Sleep-pose attempt %d failed: %s", attempt + 1, exc)
-                    if attempt == 0:
-                        time.sleep(0.5)
+            if motors_enabled_by_app:
+                for attempt in range(2):
+                    try:
+                        managed_robot.goto_sleep()
+                        sleep_ok = True
+                        logger.info("Reachy reached the sleep pose")
+                        break
+                    except Exception as exc:
+                        logger.warning("Sleep-pose attempt %d failed: %s", attempt + 1, exc)
+                        if attempt == 0:
+                            time.sleep(0.5)
             if saved_speaker_volume is not None:
                 try:
                     managed_robot.client.send_command(SetVolumeCmd(volume=saved_speaker_volume))
@@ -132,7 +135,7 @@ def run(
                     logger.info("Reachy motors disabled after completed sleep move")
                 except Exception as exc:
                     logger.error("Could not disable Reachy motors during shutdown: %s", type(exc).__name__)
-            else:
+            elif motors_enabled_by_app:
                 logger.warning("sleep move did not complete; leaving motors enabled to avoid a head drop")
             try:
                 managed_robot.disable_wobbling()
@@ -152,7 +155,7 @@ def run(
     def _handle_shutdown_signal(signum: int, _frame: object) -> None:
         # Reentrancy guard: the cleanup blocks for seconds (movement stop + sleep pose); a second
         # SIGTERM re-entering mid-cleanup would abort the first pass half-way (audit 2026-07-02).
-        if _shutdown_signal_seen.is_set():
+        if _shutdown_signal_seen.is_set() or _runtime_cleaned.is_set():
             logger.info("Received signal %s during shutdown — already cleaning up", signum)
             return
         _shutdown_signal_seen.set()
@@ -400,12 +403,14 @@ def run(
         # 2026-07-02 round 2, P2). Retry once (transient heartbeat misses), then abort cleanly.
         try:
             robot.enable_motors()
+            motors_enabled_by_app = True
             robot.wake_up()
         except Exception as exc:
             logger.warning(f"Robot wake/enable on startup failed: {exc} — retrying once")
             time.sleep(2.0)
             try:
                 robot.enable_motors()
+                motors_enabled_by_app = True
                 robot.wake_up()
             except Exception:
                 logger.error("Robot wake/enable failed twice — aborting startup (no blind control loop)")

@@ -2,6 +2,7 @@
 
 import signal
 import logging
+import importlib
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -9,13 +10,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from reachy_mini_conversation_app import main, moves, config, console, handler_factory
-from reachy_mini_conversation_app.tools import core_tools
 
 
 @pytest.fixture
 def runtime(monkeypatch):
     """Replace hardware and serving boundaries while retaining run() control flow."""
+    # Other integration tests reload this module; patch the instance run() imports.
+    core_tools = importlib.import_module("reachy_mini_conversation_app.tools.core_tools")
     events = []
+    previous_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
     handlers = {}
     delays = []
     robot = MagicMock()
@@ -46,11 +49,15 @@ def runtime(monkeypatch):
     stop_event = threading.Event()
     stop_event.set()  # the poll thread exits immediately rather than outliving the test
 
-    def run():
-        main.run(args, robot=robot, app_stop_event=stop_event)
+    def run(*, supplied_robot=True):
+        try:
+            main.run(args, robot=robot if supplied_robot else None, app_stop_event=stop_event)
+        finally:
+            assert handlers == previous_handlers
 
     return SimpleNamespace(
         run=run,
+        core_tools=core_tools,
         robot=robot,
         camera=camera,
         movement=movement,
@@ -121,6 +128,9 @@ def test_pre_robot_cleanup_failure_cannot_skip_sleep(runtime, caplog, component)
     runtime.robot.goto_sleep.assert_called_once()
     runtime.robot.disable_motors.assert_called_once()
     runtime.robot.client.disconnect.assert_called_once()
+    assert runtime.robot.disable_wobbling.call_count == 2  # startup and shutdown
+    runtime.robot.media.close.assert_called_once()
+    assert runtime.events.index("disable") < runtime.events.index("disconnect")
     assert "RuntimeError" in caplog.text
     assert "private cleanup details" not in caplog.text
 
@@ -143,16 +153,66 @@ def test_failed_wake_requires_sleep_before_disabling(runtime, failures):
     runtime.robot.client.disconnect.assert_called_once()
 
 
-def test_handler_setup_failure_still_cleans_robot(runtime, monkeypatch):
-    """Initialization failures before launch also pass through the shared finally."""
-    _sleep_outcomes(runtime, 0)
+@pytest.mark.parametrize("stage", ["tools", "camera", "handler", "stream", "chatbot"])
+def test_setup_failure_preserves_motor_ownership(runtime, monkeypatch, caplog, stage):
+    """Release resources without touching motors that the app has not enabled."""
 
     def fail(*args, **kwargs):
-        raise RuntimeError("handler setup failed")
+        if stage == "camera":
+            raise main.CameraVisionInitializationError("setup failed")
+        raise RuntimeError("setup failed")
 
-    monkeypatch.setattr(handler_factory, "build_conversation_handler", fail)
-    with pytest.raises(RuntimeError, match="handler setup failed"):
+    target, name = {
+        "tools": (runtime.core_tools, "initialize_tools"),
+        "camera": (main, "initialize_camera_and_vision"),
+        "handler": (handler_factory, "build_conversation_handler"),
+        "stream": (console, "LocalStream"),
+        "chatbot": (main.gr, "Chatbot"),
+    }[stage]
+    monkeypatch.setattr(target, name, fail)
+    with pytest.raises(SystemExit if stage in {"tools", "camera"} else RuntimeError):
         runtime.run()
+    runtime.robot.enable_motors.assert_not_called()
+    runtime.robot.goto_sleep.assert_not_called()
+    runtime.robot.disable_motors.assert_not_called()
+    runtime.robot.media.close.assert_called_once()
+    runtime.robot.client.disconnect.assert_called_once()
+    assert "leaving motors enabled" not in caplog.text
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_first_signal_during_normal_cleanup_does_not_interrupt(runtime, signum):
+    """A signal arriving in finally lets that cleanup finish and restore handlers."""
+    runtime.robot.goto_sleep.side_effect = lambda: runtime.handlers[signum](signum, None)
+    runtime.run()
     runtime.robot.goto_sleep.assert_called_once()
     runtime.robot.disable_motors.assert_called_once()
+    runtime.robot.media.close.assert_called_once()
     runtime.robot.client.disconnect.assert_called_once()
+
+
+def test_robot_constructor_failure_has_no_robot_to_clean(runtime, monkeypatch):
+    """A failed connection must restore signal handlers without robot cleanup calls."""
+    constructor = MagicMock(side_effect=RuntimeError("connection failed"))
+    monkeypatch.setattr(main, "ReachyMini", constructor)
+    with pytest.raises(SystemExit):
+        runtime.run(supplied_robot=False)
+    constructor.assert_called_once()
+    assert runtime.robot.mock_calls == []
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_enable_failure_only_claims_motors_after_success(runtime, caplog, failures):
+    """A retry can acquire ownership, but two failed enable calls cannot."""
+    runtime.robot.enable_motors.side_effect = [RuntimeError("enable failed")] * failures + [None]
+    _sleep_outcomes(runtime, 0)
+    if failures == 2:
+        with pytest.raises(RuntimeError, match="enable failed"):
+            runtime.run()
+    else:
+        runtime.run()
+    assert runtime.robot.goto_sleep.call_count == int(failures == 1)
+    assert runtime.robot.disable_motors.call_count == int(failures == 1)
+    runtime.robot.media.close.assert_called_once()
+    runtime.robot.client.disconnect.assert_called_once()
+    assert "leaving motors enabled" not in caplog.text

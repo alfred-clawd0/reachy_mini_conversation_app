@@ -499,13 +499,16 @@ The quiet settings in `.env.example` are commented suggestions, not active defau
 to `1`; `AGENT_GAP_FILL_MAX` defaults to `2`. Set all four to `0` for answer-only speech.
 The motion switches listed above also default to `1`.
 
-Shutdown disables motors only after a sleep move completes successfully, including in
-daemon-hosted runs. Sleep is tried twice, 0.5 seconds apart; if both attempts fail or time
-out, torque stays enabled to avoid a head drop, and the client disconnects. Camera or
+Shutdown commands sleep only if this app successfully enabled the motors, and disables
+them only after a sleep move completes successfully, including in daemon-hosted runs.
+Setup failures before motor enable release resources without sleeping or cutting torque.
+Sleep is tried twice, 0.5 seconds apart; if both attempts fail or time out, torque stays enabled to avoid a head drop, and the client disconnects. Camera or
 movement-worker cleanup failures do not skip robot cleanup. A second startup wake failure
 uses the same sleep-confirmed cleanup because a timed-out move may still be running.
-Microphone quieting happens while listening (breathing is cancelled); use the documented
-quiet-motion profile above to reduce other motion. It does not depend on exit behavior.
+Microphone quieting happens while listening (breathing is cancelled). Use the motion
+switches in the configuration table (`AGENT_IDLE_BREATHING`, `AGENT_IDLE_ACTIONS`,
+`AGENT_SPEECH_SWAY`, and `AGENT_SPEECH_WOBBLE`) and the quiet-motion suggestions in
+`.env.example` to reduce other motion. Listening-time quieting is independent of shutdown.
 
 Deploy this client together with the [hermes-reachy authentication adapter](https://github.com/alfred-clawd0/hermes-reachy) update.
 The repository home is [alfred-clawd0/reachy_mini_conversation_app](https://github.com/alfred-clawd0/reachy_mini_conversation_app);
