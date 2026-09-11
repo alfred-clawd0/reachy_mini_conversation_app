@@ -29,10 +29,18 @@ from __future__ import annotations
 import os
 import re
 import json
+import time
 import uuid
 import asyncio
 import logging
-from collections.abc import Callable, Awaitable
+import ipaddress
+from typing import Any
+from pathlib import Path
+from urllib.parse import urlsplit
+from collections.abc import Callable, Awaitable, AsyncIterator
+
+from websockets.exceptions import ConnectionClosed
+from websockets.asyncio.client import ClientConnection
 
 from reachy_mini_conversation_app.agent_clients import (
     _env_int,
@@ -44,6 +52,27 @@ from reachy_mini_conversation_app.agent_clients import (
 
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
+_sleep = asyncio.sleep
+# The adapter rejects bad keys on hello and enforces HELLO_TIMEOUT_S = 10.0.
+# Allow a two-second margin before treating an open, silent session as healthy.
+_AUTH_GRACE_S = 12.0
+
+
+class _ProtocolLogger(logging.LoggerAdapter[logging.Logger]):
+    """Never expose WebSocket frame payloads, even after logging reconfiguration."""
+
+    def isEnabledFor(self, level: int) -> bool:
+        """Disable protocol DEBUG unconditionally."""
+        return level > logging.DEBUG and super().isEnabledFor(level)
+
+    def log(self, level: int, msg: object, *args: Any, **kwargs: Any) -> None:
+        """Drop DEBUG records before forwarding to the configured logger."""
+        if level > logging.DEBUG:
+            super().log(level, msg, *args, **kwargs)
+
+
+_protocol_logger = _ProtocolLogger(logging.getLogger(__name__ + ".protocol"), {})
 
 # A run of text ending in sentence punctuation or a newline = one complete sentence.
 _SENTENCE_RE = re.compile(r"[^.!?…\n]*(?:[.!?…]+|\n+)", re.S)
@@ -54,9 +83,29 @@ _CURSORS = "█▉▊▋▌▍▎▏"
 _CURSOR_STRIP = {ord(c): None for c in _CURSORS}
 # System/tool-status notices the gateway pushes as standalone messages; not
 # conversational answer text, so not spoken.
-_NOTICE_PREFIXES = ("ℹ", "\U0001f4ec", "✅", "\U0001f40d", "⚡", "\U0001f4e1",
-                    "\U0001f514", "\U0001f916", "♻", "⏳", "❌", "⚠",
-                    "\U0001f4ce", "\U0001f4f7", "\U0001f3a4", "\U0001f500")
+_NOTICE_PREFIXES = (
+    "ℹ",
+    "\U0001f4ec",
+    "✅",
+    "\U0001f40d",
+    "⚡",
+    "\U0001f4e1",
+    "\U0001f514",
+    "\U0001f916",
+    "♻",
+    "⏳",
+    "❌",
+    "⚠",
+    "⚙",
+    "\U0001f6e0",
+    "\U0001f527",
+    "\U0001f4ce",
+    "\U0001f4f7",
+    "\U0001f3a4",
+    "\U0001f500",
+)
+_EMOJI_PREFIX_RE = re.compile(r"^[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF]")
+_REPEAT_NOTICE_RE = re.compile(r"^\(\s*[×x]\s*\d+\s*\)$", re.IGNORECASE)
 
 
 def _complete_sentences(text: str) -> tuple[list[str], str]:
@@ -72,14 +121,17 @@ def _complete_sentences(text: str) -> tuple[list[str], str]:
 
 
 def _looks_like_notice(text: str) -> bool:
-    """A gateway system/tool-status line (emoji-prefixed), not spoken answer text."""
+    """Identify gateway system/tool-status lines rather than answer text."""
     t = (text or "").lstrip()
-    return bool(t) and t.startswith(_NOTICE_PREFIXES)
+    return bool(t) and (
+        t.startswith(_NOTICE_PREFIXES)
+        or _EMOJI_PREFIX_RE.match(t) is not None
+        or _REPEAT_NOTICE_RE.fullmatch(t) is not None
+    )
 
 
 class _AnswerAccumulator:
-    """Turns a stream of gateway ``say`` frames into ordered, deduped, voice-sized
-    chunks.
+    """Turns a stream of gateway ``say`` frames into ordered, deduped, voice-sized chunks.
 
     Locks onto the first non-notice message id, strips the streaming cursor, and
     emits via the shared ``_drain_voice_chunks``: the FIRST chunk may end at a clause
@@ -93,15 +145,13 @@ class _AnswerAccumulator:
     def __init__(self) -> None:
         self.answer_id: str | None = None
         self.last_full = ""
-        self._ignored: set = set()  # message ids from interrupted (barged) turns
-        self._emitted_len = 0       # chars of the answer already emitted (a stable prefix)
-        self._produced = False      # first chunk emitted -> later chunks are sentence-bounded
+        self._ignored: set[str] = set()  # message ids from interrupted (barged) turns
+        self._emitted_len = 0  # chars of the answer already emitted (a stable prefix)
+        self._produced = False  # first chunk emitted -> later chunks are sentence-bounded
         self._min = _env_int("AGENT_FIRST_CHUNK_MIN_CHARS", 15)
 
     def restart(self) -> None:
-        """After a barge/interrupt: forget the current (now-cancelled) answer and
-        re-lock onto the NEXT new message, ignoring stragglers of the old one.
-        """
+        """After a barge/interrupt: forget the current (now-cancelled) answer and re-lock onto the NEXT new message, ignoring stragglers of the old one."""
         if self.answer_id is not None:
             self._ignored.add(self.answer_id)
         self.answer_id = None
@@ -109,7 +159,7 @@ class _AnswerAccumulator:
         self._emitted_len = 0
         self._produced = False
 
-    def feed(self, frame: dict) -> list[str]:
+    def feed(self, frame: dict[str, Any]) -> list[str]:
         """Consume one ``say`` frame; return newly-complete voice chunks to emit."""
         content = (frame.get("content") or "").translate(_CURSOR_STRIP)
         mid = frame.get("message_id")
@@ -122,14 +172,14 @@ class _AnswerAccumulator:
         if mid != self.answer_id:
             return []  # a concurrent notice while the answer streams — skip
         self.last_full = content
-        candidate = content[self._emitted_len:]  # unemitted suffix (emitted prefix is stable)
+        candidate = content[self._emitted_len :]  # unemitted suffix (emitted prefix is stable)
         chunks, remaining, self._produced = _drain_voice_chunks(candidate, self._produced, self._min)
         self._emitted_len += len(candidate) - len(remaining)
         return chunks
 
     def finish(self) -> list[str]:
         """Flush the final answer incl. a trailing chunk with no terminator."""
-        tail = self.last_full[self._emitted_len:].strip()
+        tail = self.last_full[self._emitted_len :].strip()
         self._emitted_len = len(self.last_full)
         return [tail] if tail else []
 
@@ -138,11 +188,41 @@ class ReachyPlatformConfig:
     """Config for the platform ws transport (env-driven)."""
 
     def __init__(self) -> None:
+        """Initialize the configured state."""
         self.ws_url = os.getenv("AGENT_PLATFORM_WS_URL", "ws://127.0.0.1:8770/robot/reachy").strip()
         self.robot_id = os.getenv("AGENT_PLATFORM_ROBOT_ID", "reachy").strip() or "reachy"
+        self.api_key = ""
+        self._missing_key_logged = False
+        self.reload_api_key()
+        endpoint = urlsplit(self.ws_url)
+        host = endpoint.hostname or ""
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host.lower() == "localhost"
+        if endpoint.scheme == "ws" and not loopback:
+            logger.warning("[reachy-platform] non-loopback ws:// endpoint sends the API key in plaintext; use wss://")
         self.turn_timeout_s = _env_float("AGENT_PLATFORM_TURN_TIMEOUT_S", 90.0)
         self.connect_timeout_s = _env_float("AGENT_PLATFORM_CONNECT_TIMEOUT_S", 10.0)
         self.max_response_chars = _env_int("AGENT_MAX_RESPONSE_CHARS", 2000)
+
+    def reload_api_key(self) -> None:
+        """Reload credentials without logging contents or decoder exception details."""
+        self.api_key = os.getenv("AGENT_PLATFORM_API_KEY", "").strip()
+        key_file = os.getenv("AGENT_PLATFORM_API_KEY_FILE", "").strip()
+        error_type = ""
+        if not self.api_key and key_file:
+            try:
+                self.api_key = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError) as exc:
+                error_type = type(exc).__name__
+        if not self.api_key and not self._missing_key_logged:
+            logger.error(
+                "[reachy-platform] no platform API key configured%s%s",
+                f" (file: {key_file})" if key_file else "",
+                f" ({error_type})" if error_type else "",
+            )
+        self._missing_key_logged = not bool(self.api_key)
 
 
 ProactiveHandler = Callable[[str], Awaitable[None]]
@@ -160,20 +240,25 @@ class ReachyPlatformClient:
         config: ReachyPlatformConfig | None = None,
         on_proactive: ProactiveHandler | None = None,
     ) -> None:
+        """Initialize the configured state."""
         self.config = config or ReachyPlatformConfig()
         self._on_proactive = on_proactive
-        self._ws = None
-        self._reader_task: asyncio.Task | None = None
-        self._turn_q: asyncio.Queue | None = None  # set while an interactive turn is in flight
+        self._ws: ClientConnection | None = None
+        self._reader_task: asyncio.Task[Any] | None = None
+        self._turn_q: asyncio.Queue[Any] | None = None  # set while an interactive turn is in flight
         self._active_turn_id: str | None = None  # client turn id the reader routes frames by
         self._turn_lock = asyncio.Lock()  # single-flight interactive turns
+        self._auth_rejected = False
+        self._auth_retry_at = 0.0
+        self._auth_backoff = 60.0
+        self._superseded = False
         self._closed = False  # final shutdown flag: stops the reconnect supervisor
-        self._supervisor_task: asyncio.Task | None = None
-        self._proactive_tasks: set[asyncio.Task] = set()  # keep refs (loop holds tasks weakly)
+        self._supervisor_task: asyncio.Task[Any] | None = None
+        self._proactive_tasks: set[asyncio.Task[Any]] = set()  # keep refs (loop holds tasks weakly)
         self.on_turn_progress: Callable[[], None] | None = None  # stall-watchdog liveness hook
         # Body-tool surface (gap-map Stufe 3): async callback(action, params) -> result dict.
-        self.on_tool_call: Callable[[str, dict], Any] | None = None
-        self._tool_tasks: set[asyncio.Task] = set()
+        self.on_tool_call: Callable[[str, dict[str, Any]], Any] | None = None
+        self._tool_tasks: set[asyncio.Task[Any]] = set()
         # Serializes session creation: supervisor and ask_stream both call _ensure_session; two
         # concurrent connects raced to two sockets/two hellos, and if the UNREAD one won the
         # gateway's robot map, every reply ran into the void until app restart (review
@@ -193,17 +278,22 @@ class ReachyPlatformClient:
 
     async def _supervise(self) -> None:
         backoff = 1.0
-        while not self._closed:
+        while not self._closed and not self._superseded:
             if self._ws is None:
                 try:
                     await self._ensure_session()
                     backoff = 1.0
                 except Exception as e:
+                    if self._superseded:
+                        return
+                    if self._auth_retry_at > _monotonic():
+                        await _sleep(min(1.0, self._auth_retry_at - _monotonic()))
+                        continue
                     logger.info("[reachy-platform] reconnect failed (%s) — retry in %.0fs", e, backoff)
-                    await asyncio.sleep(backoff)
+                    await _sleep(backoff)
                     backoff = min(backoff * 2.0, 30.0)
                     continue
-            await asyncio.sleep(1.0)
+            await _sleep(1.0)
 
     def set_proactive_handler(self, handler: ProactiveHandler | None) -> None:
         """Register the async callback that speaks proactively-delivered text."""
@@ -212,30 +302,90 @@ class ReachyPlatformClient:
     # ── session / reader ────────────────────────────────────────────────────
     async def _ensure_session(self) -> None:
         async with self._connect_lock:
+            if self._superseded:
+                raise ConnectionError("connection superseded by another app instance")
+            if _monotonic() < self._auth_retry_at:
+                raise ConnectionError("platform credentials awaiting scheduled retry")
             if self._ws is None:
+                self._auth_retry_at = 0.0
+                await asyncio.to_thread(self.config.reload_api_key)
+                if not self.config.api_key:
+                    self._schedule_auth_retry()
+                    raise ConnectionError("no platform API key configured")
                 from websockets.asyncio.client import connect
 
-                ws = await asyncio.wait_for(connect(self.config.ws_url), timeout=self.config.connect_timeout_s)
+                ws = await asyncio.wait_for(
+                    connect(self.config.ws_url, logger=_protocol_logger), timeout=self.config.connect_timeout_s
+                )
                 try:
-                    await ws.send(json.dumps({"type": "hello", "robot_id": self.config.robot_id}))
-                except Exception:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "hello",
+                                "robot_id": self.config.robot_id,
+                                "api_key": self.config.api_key,
+                            }
+                        )
+                    )
+                except Exception as exc:
+                    policy_close = self._check_auth_rejection(exc)
                     # gateway reset between connect and hello: close instead of leaking the socket
                     try:
                         await ws.close()
                     except Exception:
                         pass
+                    if policy_close:
+                        raise ConnectionError("platform policy close") from None
                     raise
                 self._ws = ws
                 logger.info("[reachy-platform] connected to %s", self.config.ws_url)
             if self._reader_task is None or self._reader_task.done():
                 self._reader_task = asyncio.create_task(self._reader())
 
-    def _route(self, frame: dict) -> str:
-        """Decide where an inbound frame goes: 'turn' (active interactive turn), 'proactive'
-        (unsolicited delivery), or 'drop' (straggler of a cancelled/older turn).
+    def _schedule_auth_retry(self) -> None:
+        if self._auth_retry_at <= _monotonic():
+            self._auth_retry_at = _monotonic() + self._auth_backoff
+            self._auth_backoff = min(900.0, self._auth_backoff * 2.0)
+
+    def _check_close(self, code: int | None, reason: str | None) -> bool:
+        if code == 4001 or (code == 1000 and "superseded" in (reason or "").lower()):
+            if not self._superseded:
+                logger.error(
+                    "[reachy-platform] another client with robot_id=%s took over this connection; "
+                    "check for a duplicate app instance",
+                    self.config.robot_id,
+                )
+            self._superseded = True
+        elif code == 1008:
+            if not self._auth_rejected:
+                logger.error(
+                    "[reachy-platform] authentication rejected (1008); retrying credentials in %.0fs, "
+                    "with exponential backoff up to 900s",
+                    self._auth_backoff,
+                )
+            self._auth_rejected = True
+            self._schedule_auth_retry()
+        else:
+            return False
+        return True
+
+    def _check_auth_rejection(self, exc: Exception) -> bool:
+        """Handle policy closes without logging the peer's potentially sensitive reason."""
+        if isinstance(exc, ConnectionClosed) and exc.rcvd is not None:
+            return self._check_close(exc.rcvd.code, exc.rcvd.reason)
+        return False
+
+    def _reset_auth_streak(self) -> None:
+        self._auth_rejected = False
+        self._auth_retry_at = 0.0
+        self._auth_backoff = 60.0
+
+    def _route(self, frame: dict[str, Any]) -> str:
+        """Decide where an inbound frame goes: 'turn' (active interactive turn), 'proactive' (unsolicited delivery), or 'drop' (straggler of a cancelled/older turn).
 
         Uses the gateway's turn_id/origin correlation (audit 2026-07-02, V5c). Falls back to the
-        old purely-temporal rule when the frame carries no turn_id (older gateway): active turn -> turn."""
+        old purely-temporal rule when the frame carries no turn_id (older gateway): active turn -> turn.
+        """
         has_tid = "turn_id" in frame
         if not has_tid:
             return "turn" if self._turn_q is not None else "proactive"
@@ -250,13 +400,22 @@ class ReachyPlatformClient:
         return "drop"
 
     async def _reader(self) -> None:
-        """Single consumer of the ws: route each frame by turn_id to the active turn queue,
-        the proactive handler, or drop (straggler of a cancelled turn).
-        """
+        """Single consumer of the ws: route each frame by turn_id to the active turn queue, the proactive handler, or drop (straggler of a cancelled turn)."""
         ws = self._ws
+        if ws is None:
+            return
+
+        async def confirm_quiet_session() -> None:
+            # The adapter has no hello_ok yet. A socket still open after its hello deadline
+            # is evidence of acceptance, even when no proactive/application traffic arrives.
+            await asyncio.sleep(_AUTH_GRACE_S)
+            if self._ws is ws and getattr(ws, "close_code", None) is None:
+                self._reset_auth_streak()
+
+        auth_grace = asyncio.create_task(confirm_quiet_session())
         prot = _AnswerAccumulator()
         prot_chunks: list[str] = []
-        settle_task: asyncio.Task | None = None
+        settle_task: asyncio.Task[Any] | None = None
         settle_s = float(os.getenv("AGENT_PROACTIVE_SETTLE_S", "3.0"))
 
         def _flush_proactive() -> None:
@@ -302,6 +461,9 @@ class ReachyPlatformClient:
                     frame = json.loads(raw)
                 except Exception:
                     continue
+                # Without hello_ok, an inbound application frame is evidence of acceptance.
+                self._reset_auth_streak()
+                auth_grace.cancel()
                 if frame.get("type") == "tool_call":
                     # gateway-requested body action — independent of turn routing
                     t = asyncio.create_task(self._run_tool_call(frame))
@@ -321,6 +483,7 @@ class ReachyPlatformClient:
                             cb()
                         except Exception:
                             pass
+                    assert self._turn_q is not None
                     self._turn_q.put_nowait(frame)
                     continue
                 # proactive delivery
@@ -332,8 +495,12 @@ class ReachyPlatformClient:
                     _cancel_settle()
                     _flush_proactive()
         except Exception as e:
-            logger.info("[reachy-platform] reader ended: %s", e)
+            if self._ws is ws and not self._check_auth_rejection(e):
+                logger.info("[reachy-platform] reader ended: %s", e)
         finally:
+            auth_grace.cancel()
+            if self._ws is ws:
+                self._check_close(getattr(ws, "close_code", None), getattr(ws, "close_reason", None))
             # unblock any waiting turn and drop the session so the supervisor/next turn
             # reconnects — but only OUR session (a stale reader must not clobber a newer ws).
             if self._turn_q is not None:
@@ -341,15 +508,21 @@ class ReachyPlatformClient:
             if self._ws is ws:
                 self._ws = None
 
-    async def _run_tool_call(self, frame: dict) -> None:
+    async def _run_tool_call(self, frame: dict[str, Any]) -> None:
         """Execute one gateway body-tool request and send the tool_result back."""
         tcid = str(frame.get("tool_call_id") or "")
+        from reachy_mini_conversation_app.pipeline_monitor import get_pipeline_monitor
+
+        monitor = get_pipeline_monitor()
+        action = str(frame.get("action") or "")
+        if monitor is not None:
+            monitor.emit("tool", action, status="started", tool_call_id=tcid)
         handler = self.on_tool_call
         if handler is None:
-            result: dict = {"error": "no tool handler registered"}
+            result: dict[str, Any] = {"error": "no tool handler registered"}
         else:
             try:
-                result = await handler(str(frame.get("action") or ""), frame.get("params") or {})
+                result = await handler(action, frame.get("params") or {})
                 if not isinstance(result, dict):
                     result = {"result": result}
             except Exception as exc:
@@ -359,11 +532,14 @@ class ReachyPlatformClient:
         if ws is None:
             return
         try:
-            await ws.send(json.dumps(
-                {"type": "tool_result", "tool_call_id": tcid, "result": result,
-                 "robot_id": self.config.robot_id},
-                ensure_ascii=False,
-            ))
+            await ws.send(
+                json.dumps(
+                    {"type": "tool_result", "tool_call_id": tcid, "result": result, "robot_id": self.config.robot_id},
+                    ensure_ascii=False,
+                )
+            )
+            if monitor is not None:
+                monitor.emit("tool", action, status="completed", tool_call_id=tcid, ok="error" not in result)
         except Exception as exc:
             logger.warning("[reachy-platform] tool_result send failed: %s", exc)
 
@@ -375,13 +551,13 @@ class ReachyPlatformClient:
         except Exception as e:  # never let a handler kill anything
             logger.warning("[reachy-platform] proactive handler failed: %s", e)
 
-    async def _reset_session(self, only_if=None) -> None:
-        """Drop the current ws/reader after a turn error so the supervisor (or the next turn)
-        reconnects. Does NOT stop the supervisor — that's aclose()'s job.
+    async def _reset_session(self, only_if: ClientConnection | None = None) -> None:
+        """Drop the current ws/reader after a turn error so the supervisor (or the next turn) reconnects. Does NOT stop the supervisor — that's aclose()'s job.
 
         ``only_if``: the ws the failing turn was using. A turn generator can wake seconds after
         the reader died (pacing) — by then the supervisor may have reconnected, and resetting
-        unconditionally tore down the fresh healthy session (review 2026-07-02 round 2, P3)."""
+        unconditionally tore down the fresh healthy session (review 2026-07-02 round 2, P3).
+        """
         if only_if is not None and self._ws is not None and self._ws is not only_if:
             return  # a newer session exists — leave it alone
         ws, self._ws = self._ws, None
@@ -395,7 +571,7 @@ class ReachyPlatformClient:
             task.cancel()
 
     async def aclose(self) -> None:
-        """Final shutdown: stop the reconnect supervisor and close the session."""
+        """Stop the reconnect supervisor and close the session on final shutdown."""
         self._closed = True
         sup, self._supervisor_task = self._supervisor_task, None
         if sup is not None:
@@ -403,9 +579,7 @@ class ReachyPlatformClient:
         await self._reset_session()
 
     async def interrupt(self, text: str | None = None) -> None:
-        """Barge-in: cancel the gateway's in-flight turn. ``text`` = a committed
-        interrupt command (the gateway's ``interrupt`` mode cancels the running
-        turn and answers this instead); ``None``/empty = a bare stop (``/stop``).
+        """Barge-in: cancel the gateway's in-flight turn. ``text`` = a committed interrupt command (the gateway's ``interrupt`` mode cancels the running turn and answers this instead); ``None``/empty = a bare stop (``/stop``).
 
         Also rolls the active turn_id to a NEW id and injects a local ``_barge_reset``
         control frame so the active ``ask_stream`` re-locks onto the interrupt turn; the
@@ -438,14 +612,18 @@ class ReachyPlatformClient:
             return
         payload = (text or "").strip() or "/stop"
         try:
-            await ws.send(json.dumps(
-                {"type": "interrupt", "text": payload, "robot_id": self.config.robot_id, "turn_id": new_turn_id}
-            ))
+            await ws.send(
+                json.dumps(
+                    {"type": "interrupt", "text": payload, "robot_id": self.config.robot_id, "turn_id": new_turn_id}
+                )
+            )
         except Exception as e:
             logger.warning("[reachy-platform] interrupt send failed: %s", e)
 
     # ── interactive turn ────────────────────────────────────────────────────
-    async def ask_stream(self, transcript: str, context: str | None = None, image_url: str | None = None):
+    async def ask_stream(
+        self, transcript: str, context: str | None = None, image_url: str | None = None
+    ) -> AsyncIterator[str]:
         """Yield voice-sized sentence chunks of AGENT's reply over the ws transport.
 
         ``image_url`` is not carried by the platform text channel in v1 (native
@@ -453,12 +631,12 @@ class ReachyPlatformClient:
         """
         cleaned = (transcript or "").strip()
         if not cleaned:
-            yield "Das habe ich akustisch nicht erwischt."
+            yield "I didn't quite catch that."
             return
         composed = _compose_user(cleaned, context)
 
         async with self._turn_lock:
-            q: asyncio.Queue = asyncio.Queue()
+            q: asyncio.Queue[Any] = asyncio.Queue()
             self._turn_q = q  # register BEFORE the reader starts so no frame is missed
             turn_id = uuid.uuid4().hex
             self._active_turn_id = turn_id  # reader routes only this turn's frames here
@@ -466,15 +644,17 @@ class ReachyPlatformClient:
             try:
                 await self._ensure_session()
                 turn_ws = self._ws
-                await self._ws.send(json.dumps(
-                    {"type": "stt", "text": composed, "robot_id": self.config.robot_id, "turn_id": turn_id}
-                ))
+                assert self._ws is not None
+                await self._ws.send(
+                    json.dumps({"type": "stt", "text": composed, "robot_id": self.config.robot_id, "turn_id": turn_id})
+                )
             except Exception as e:
                 self._turn_q = None
                 self._active_turn_id = None  # invariant: no active turn -> frames route proactive
-                logger.warning("[reachy-platform] send failed: %s", e)
+                if not self._check_auth_rejection(e):
+                    logger.warning("[reachy-platform] send failed: %s", e)
                 await self._reset_session(only_if=turn_ws)  # keep the reconnect supervisor alive
-                yield "Da hakt gerade die Verbindung zu AGENT."
+                yield "I'm having trouble connecting to the agent right now."
                 return
 
             acc = _AnswerAccumulator()
@@ -508,7 +688,7 @@ class ReachyPlatformClient:
                     if turn_outcome == "success":
                         logger.info("[reachy-platform] turn ended successfully with no speakable text")
                     else:
-                        yield "Da hakt gerade die Verbindung zu AGENT."
+                        yield "I'm having trouble connecting to the agent right now."
             except asyncio.TimeoutError:
                 logger.warning("[reachy-platform] turn timed out")
                 # Stop the gateway's generation: without the /stop it keeps producing, and the
@@ -519,17 +699,20 @@ class ReachyPlatformClient:
                 except Exception:
                     pass
                 if not produced:
-                    yield "Das dauert gerade ungewöhnlich lange — frag mich gleich nochmal."
+                    yield "This is taking unusually long. Please ask me again in a moment."
             except Exception as e:
                 logger.warning("[reachy-platform] turn failed: %s", e)
                 await self._reset_session(only_if=turn_ws)  # keep the reconnect supervisor alive
                 if not produced:
-                    yield "Da hakt gerade die Verbindung zu AGENT."
+                    yield "I'm having trouble connecting to the agent right now."
             finally:
                 self._turn_q = None
                 self._active_turn_id = None  # no active turn -> later frames route as proactive
 
     async def ask(self, transcript: str, context: str | None = None, image_url: str | None = None) -> str:
+        """Return the agent response."""
         parts = [chunk async for chunk in self.ask_stream(transcript, context, image_url)]
         text = " ".join(p.strip() for p in parts if p and p.strip())
-        return _trim_for_voice(text or "Da hakt gerade die Verbindung zu AGENT.", self.config.max_response_chars)
+        return _trim_for_voice(
+            text or "I'm having trouble connecting to the agent right now.", self.config.max_response_chars
+        )

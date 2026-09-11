@@ -8,11 +8,22 @@ import pytest
 from fastrtc import AdditionalOutputs
 
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
-from reachy_mini_conversation_app.agent_voice_handler import AgentVoiceHandler, FakeAudioTtsClient, FakeTextAgentClient
+from reachy_mini_conversation_app.agent_voice_handler import (
+    AgentVoiceHandler,
+    FakeAudioTtsClient,
+    FakeTextAgentClient,
+    _text_for_speech,
+)
 
 
 class _FakeMovementManager:
     pass
+
+
+def test_text_for_speech_removes_emojis() -> None:
+    assert _text_for_speech("Great news 😊 — all done ✅") == "Great news — all done"
+    assert _text_for_speech("👨‍💻") == ""
+    assert _text_for_speech("The temperature is 72°F.") == "The temperature is 72°F."
 
 
 class _AsyncTextClient:
@@ -109,6 +120,20 @@ async def test_agent_voice_handler_accepts_async_agent_and_tts_clients() -> None
 
 
 @pytest.mark.asyncio
+async def test_agent_voice_handler_normalizes_display_text_before_tts() -> None:
+    tts_client = FakeAudioTtsClient(sample_rate=24000, audio=np.array([1], dtype=np.int16))
+    handler = AgentVoiceHandler(
+        ToolDependencies(reachy_mini=object(), movement_manager=_FakeMovementManager()),
+        agent_client=FakeTextAgentClient(reply="There is a 20–35% chance. See https://example.com."),
+        tts_client=tts_client,
+    )
+
+    await handler.handle_final_transcript("Will it rain?")
+
+    assert tts_client.calls == ["There is a 20 to 35 percent chance. See the link."]
+
+
+@pytest.mark.asyncio
 async def test_agent_voice_handler_apply_personality_keeps_agent_identity() -> None:
     handler = AgentVoiceHandler(
         ToolDependencies(reachy_mini=object(), movement_manager=_FakeMovementManager()),
@@ -119,7 +144,7 @@ async def test_agent_voice_handler_apply_personality_keeps_agent_identity() -> N
     result = await handler.apply_personality("pirate")
 
     # AGENT stays the brain; a non-work profile keeps full tools (no gateway-toolset restriction).
-    assert "Agent" in result and "volle Tools" in result
+    assert "Agent" in result and "full tools active" in result
     assert handler.second_assistant_detected is False
 
 
@@ -158,7 +183,7 @@ async def test_agent_voice_handler_reports_sanitized_agent_failure() -> None:
     messages = _messages(_drain(handler))
     assert messages == [
         {"role": "user", "content": "Hallo"},
-        {"role": "assistant", "content": "Da hakt gerade die Verbindung zu AGENT."},
+        {"role": "assistant", "content": "I'm having trouble connecting to the agent right now."},
     ]
     assert "internal" not in str(messages)
 
@@ -178,7 +203,7 @@ async def test_agent_voice_handler_reports_sanitized_tts_failure_without_audio()
     assert messages == [
         {"role": "user", "content": "Hallo"},
         {"role": "assistant", "content": "Antwort."},
-        {"role": "assistant", "content": "Ich habe die Antwort erzeugt, aber die Sprachausgabe hakt gerade."},
+        {"role": "assistant", "content": "I generated the answer, but speech output is having trouble."},
     ]
     assert not [output for output in outputs if isinstance(output, tuple)]
     assert "internal" not in str(messages)
@@ -202,7 +227,9 @@ def _messages(outputs: list[object]) -> list[object]:
 def test_handler_toggles(monkeypatch):
     import os
     from unittest.mock import MagicMock
+
     from reachy_mini_conversation_app.agent_voice_handler import AgentVoiceHandler
+
     h = AgentVoiceHandler(MagicMock(), agent_client=MagicMock(), tts_client=MagicMock())
     monkeypatch.delenv("AGENT_VOICE_TOOLS", raising=False)
     monkeypatch.delenv("AGENT_VISION_ENABLED", raising=False)
@@ -211,36 +238,63 @@ def test_handler_toggles(monkeypatch):
     monkeypatch.delenv("AGENT_IDLE_ACTIONS", raising=False)
     monkeypatch.delenv("AGENT_SPEECH_SWAY", raising=False)
     t = h.get_toggles()
-    assert t == {"tools": True, "vision": True, "person_id": True, "mic": True,
-                 "companion": False, "idle_actions": True, "speech_sway": True}
-    h.set_toggle("tools", False); assert os.environ["AGENT_VOICE_TOOLS"] == "0"
-    h.set_toggle("person_id", False); assert os.environ["AGENT_VISION_BLOCK_PERSON_ID"] == "1"
-    h.set_toggle("mic", False); assert h._mic_muted is True
-    h.set_toggle("companion", True); assert os.environ["AGENT_COMPANION"] == "1"
-    assert h.get_toggles() == {"tools": False, "vision": True, "person_id": False, "mic": False,
-                               "companion": True, "idle_actions": True, "speech_sway": True}
+    assert t == {
+        "tools": True,
+        "vision": True,
+        "person_id": True,
+        "mic": True,
+        "companion": False,
+        "idle_actions": True,
+        "speech_sway": True,
+    }
+    h.set_toggle("tools", False)
+    assert os.environ["AGENT_VOICE_TOOLS"] == "0"
+    h.set_toggle("person_id", False)
+    assert os.environ["AGENT_VISION_BLOCK_PERSON_ID"] == "1"
+    h.set_toggle("mic", False)
+    assert h._mic_muted is True
+    h.set_toggle("companion", True)
+    assert os.environ["AGENT_COMPANION"] == "1"
+    assert h.get_toggles() == {
+        "tools": False,
+        "vision": True,
+        "person_id": False,
+        "mic": False,
+        "companion": True,
+        "idle_actions": True,
+        "speech_sway": True,
+    }
     import pytest
+
     with pytest.raises(KeyError):
         h.set_toggle("nope", True)
 
 
 def test_handler_settings(monkeypatch):
     import os
-    import pytest
     from unittest.mock import MagicMock
+
+    import pytest
+
     from reachy_mini_conversation_app.agent_voice_handler import AgentVoiceHandler
+
     h = AgentVoiceHandler(MagicMock(), agent_client=MagicMock(), tts_client=MagicMock())
     monkeypatch.setenv("AGENT_VOICE_REASONING_EFFORT", "minimal")
     # select validated + applied to env
     s = h.set_setting("reasoning_effort", "low")
     assert os.environ["AGENT_VOICE_REASONING_EFFORT"] == "low" and s["reasoning_effort"] == "low"
     # numerics applied + clamped
-    h.set_setting("quicktake_delay_s", 1.2); assert os.environ["AGENT_QUICKTAKE_DELAY_S"] == "1.2"
-    h.set_setting("first_audio_budget_s", 999); assert os.environ["AGENT_VOICE_FIRST_AUDIO_BUDGET_S"] == "120.0"
-    h.set_setting("output_gain", 5.0); assert h._output_gain == 3.0  # clamped to 3.0
+    h.set_setting("quicktake_delay_s", 1.2)
+    assert os.environ["AGENT_QUICKTAKE_DELAY_S"] == "1.2"
+    h.set_setting("first_audio_budget_s", 999)
+    assert os.environ["AGENT_VOICE_FIRST_AUDIO_BUDGET_S"] == "120.0"
+    h.set_setting("output_gain", 5.0)
+    assert h._output_gain == 3.0  # clamped to 3.0
     # bools
-    h.set_setting("quicktake", False); assert os.environ["AGENT_QUICKTAKE_ENABLED"] == "0"
-    h.set_setting("tool_status", True); assert os.environ["AGENT_TOOL_STATUS_ENABLED"] == "1"
+    h.set_setting("quicktake", False)
+    assert os.environ["AGENT_QUICKTAKE_ENABLED"] == "0"
+    h.set_setting("tool_status", True)
+    assert os.environ["AGENT_TOOL_STATUS_ENABLED"] == "1"
     # validation errors -> ValueError / KeyError (console maps to 4xx)
     with pytest.raises(ValueError):
         h.set_setting("reasoning_effort", "ludicrous")
@@ -249,15 +303,23 @@ def test_handler_settings(monkeypatch):
     with pytest.raises(KeyError):
         h.set_setting("nope", 1)
     # SETTING_ENV maps every settable name (console relies on it to persist)
-    assert set(h.SETTING_ENV) >= {"reasoning_effort", "quicktake_delay_s", "first_audio_budget_s",
-                                  "output_gain", "quicktake", "tool_status"}
+    assert set(h.SETTING_ENV) >= {
+        "reasoning_effort",
+        "quicktake_delay_s",
+        "first_audio_budget_s",
+        "output_gain",
+        "quicktake",
+        "tool_status",
+    }
 
 
 @pytest.mark.asyncio
 async def test_apply_personality_work_mode_restricts_gateway_tools(monkeypatch):
     import os
     from unittest.mock import MagicMock
+
     from reachy_mini_conversation_app.agent_voice_handler import AgentVoiceHandler
+
     h = AgentVoiceHandler(MagicMock(), agent_client=MagicMock(), tts_client=MagicMock())
     monkeypatch.delenv("AGENT_VOICE_TOOLSETS", raising=False)
     await h.apply_personality("agent-workmodus")
@@ -283,8 +345,8 @@ class _FakeLeadInClient:
 
 def _mk_handler(lead_client: Any):
     from unittest.mock import MagicMock
-    return AgentVoiceHandler(MagicMock(), agent_client=MagicMock(), tts_client=MagicMock(),
-                            lead_in_client=lead_client)
+
+    return AgentVoiceHandler(MagicMock(), agent_client=MagicMock(), tts_client=MagicMock(), lead_in_client=lead_client)
 
 
 @pytest.mark.asyncio
@@ -304,6 +366,7 @@ async def test_quicktake_uses_9b_bridge_when_gateway_slow(monkeypatch):
 @pytest.mark.asyncio
 async def test_quicktake_static_fallback_when_9b_not_ready(monkeypatch):
     from reachy_mini_conversation_app.agent_clients import _STATIC_QUICKTAKES
+
     monkeypatch.setenv("AGENT_QUICKTAKE_DELAY_S", "0.05")
     monkeypatch.setenv("AGENT_QUICKTAKE_ENABLED", "1")
     h = _mk_handler(_FakeLeadInClient(text="Also.", delay=5.0))  # 9B too slow -> static
@@ -319,6 +382,7 @@ async def test_quicktake_static_fallback_when_9b_not_ready(monkeypatch):
 @pytest.mark.asyncio
 async def test_quicktake_guards_against_moment(monkeypatch):
     from reachy_mini_conversation_app.agent_clients import _STATIC_QUICKTAKES
+
     monkeypatch.setenv("AGENT_QUICKTAKE_DELAY_S", "0.05")
     monkeypatch.setenv("AGENT_QUICKTAKE_ENABLED", "1")
     h = _mk_handler(_FakeLeadInClient(text="Moment, gleich.", delay=0.0))  # collides w/ Phase A
@@ -361,10 +425,12 @@ async def test_quicktake_disabled_emits_no_opener(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_start_up_blocks_until_shutdown(monkeypatch) -> None:
-    """Regression: start_up() must block for the session lifetime (upstream base_realtime
-    contract). If it returns after setup instead, the console startup loop treats that as
-    "session ended" and re-runs it on a retry loop — spawning a fresh idle/IMU/sway/companion
-    watcher set each pass without stopping the old ones (task+CPU leak)."""
+    """Regression: start_up() must block for the session lifetime (upstream base_realtime contract).
+
+    If it returns after setup instead, the console startup loop treats that as "session ended" and re-runs it
+    on a retry loop — spawning a fresh idle/IMU/sway/companion watcher set each pass without stopping the old
+    ones (task+CPU leak).
+    """
     handler = AgentVoiceHandler(
         ToolDependencies(reachy_mini=object(), movement_manager=_FakeMovementManager()),
         agent_client=FakeTextAgentClient(reply="ok"),
@@ -379,3 +445,123 @@ async def test_start_up_blocks_until_shutdown(monkeypatch) -> None:
 
     await handler.shutdown()
     await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.parametrize("language,expected", [(None, "en"), ("", "en"), ("auto", "auto"), ("fr", "fr")])
+def test_stt_language_defaults_to_english(monkeypatch, language, expected):
+    """Default to English while preserving explicit language and auto-detection choices."""
+    from reachy_mini_conversation_app.agent_voice_handler import _stt_language
+
+    if language is None:
+        monkeypatch.delenv("AGENT_STT_LANGUAGE", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_STT_LANGUAGE", language)
+    assert _stt_language() == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply,expected",
+    [
+        ("- item one\n- item two", "item one, item two"),
+        ("1. First\n2. Second", "First, Second"),
+        ("# First\n## Second", "First Second"),
+        ("😊✅", None),
+    ],
+)
+async def test_handler_normalizes_multiline_and_empty_replies(reply, expected):
+    tts = FakeAudioTtsClient(sample_rate=24000, audio=np.array([1], dtype=np.int16))
+    handler = AgentVoiceHandler(
+        ToolDependencies(reachy_mini=object(), movement_manager=_FakeMovementManager()),
+        agent_client=FakeTextAgentClient(reply=reply),
+        tts_client=tts,
+    )
+    await handler.handle_final_transcript("Question")
+    assert tts.calls == ([expected] if expected else [])
+    outputs = _drain(handler)
+    assert not any("having trouble" in message["content"] for message in _messages(outputs))
+    if expected is None:
+        assert not any(isinstance(output, tuple) for output in outputs)
+        assert await handler._speak_sentence(reply) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("log_content", [False, True])
+async def test_handler_pipeline_events_and_log_privacy(monkeypatch, caplog, log_content):
+    import logging
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from reachy_mini_conversation_app.pipeline_monitor import PipelineMonitor
+
+    monkeypatch.setenv("AGENT_PIPELINE_MONITOR_LOG_CONTENT", "1" if log_content else "0")
+    monkeypatch.setenv("AGENT_QUICKTAKE_ENABLED", "0")
+    monkeypatch.setenv("AGENT_STT_LANGUAGE", "en")
+    caplog.set_level(logging.INFO)
+    tts = FakeAudioTtsClient(sample_rate=24000, audio=np.array([1], dtype=np.int16))
+    tts.config = SimpleNamespace(model="test-model", voice="test-voice", speed=0.95)
+    client = FakeTextAgentClient(reply="unused")
+
+    async def stream(text):
+        yield "Private answer."
+
+    monkeypatch.setattr(client, "ask_stream", stream, raising=False)
+    handler = AgentVoiceHandler(
+        ToolDependencies(reachy_mini=object(), movement_manager=_FakeMovementManager()),
+        agent_client=client,
+        tts_client=tts,
+    )
+    # Record real handler calls and exercise logging without opening a server.
+    monitor = MagicMock(wraps=PipelineMonitor(port=0))
+    handler._pipeline_monitor = monitor
+    await handler.handle_final_transcript("Private question")
+    calls = monitor.emit.call_args_list
+    stt = next(call for call in calls if call.args[0] == "stt")
+    llm = next(call for call in calls if call.args[0] == "llm")
+    spoken = next(call for call in calls if call.args[0] == "tts")
+    assert stt.args == ("stt", "Private question")
+    assert stt.kwargs == {"language": "en"}
+    assert llm.args == ("llm", "Private answer.")
+    assert llm.kwargs["first_chunk"] is True
+    assert llm.kwargs["elapsed_ms"] >= 0
+    assert spoken.args == ("tts", "Private answer.")
+    assert spoken.kwargs == {"model": "test-model", "voice": "test-voice", "speed": 0.95}
+    assert ("Private question" in caplog.text) is log_content
+    assert ("Private answer." in caplog.text) is log_content
+    assert "test-model" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chunks,failed,warning",
+    [
+        (["Done."], True, True),
+        (["Done.", "✅"], True, True),
+        (["Done. ✅"], True, True),
+        (["✅"], True, False),
+        (["✅"], False, False),
+    ],
+)
+async def test_empty_chunks_do_not_mask_tts_failures(monkeypatch, chunks, failed, warning):
+    monkeypatch.setenv("AGENT_QUICKTAKE_ENABLED", "0")
+    client = FakeTextAgentClient(reply="unused")
+
+    async def stream(text):
+        for chunk in chunks:
+            yield chunk
+
+    monkeypatch.setattr(client, "ask_stream", stream, raising=False)
+    tts = _FailingTtsClient() if failed else FakeAudioTtsClient(24000, np.array([1], dtype=np.int16))
+    handler = AgentVoiceHandler(
+        ToolDependencies(reachy_mini=object(), movement_manager=_FakeMovementManager()),
+        agent_client=client,
+        tts_client=tts,
+    )
+    await handler.handle_final_transcript("Question")
+    outputs = _drain(handler)
+    messages = _messages(outputs)
+    assert any("speech output is having trouble" in message["content"] for message in messages) is warning
+    if chunks == ["✅"]:
+        assert not any(isinstance(output, tuple) for output in outputs)
+        if not failed:
+            assert tts.calls == []

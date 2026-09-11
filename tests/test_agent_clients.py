@@ -75,8 +75,7 @@ async def test_hermes_voice_client_sends_no_tools_chat_completion(monkeypatch: p
 
 @pytest.mark.asyncio
 async def test_hermes_voice_client_enables_tools_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """By default (P1b) the voice client does NOT disable tools -> the gateway runs the full agent
-    with its api_server toolsets."""
+    """By default (P1b) the voice client does NOT disable tools -> the gateway runs the full agent with its api_server toolsets."""
     monkeypatch.setenv("TEST_AGENT_KEY", "test-secret")
     monkeypatch.delenv("AGENT_VOICE_TOOLS", raising=False)
     http = _FakeHttpClient(_FakeJsonResponse({"choices": [{"message": {"content": "ok"}}]}))
@@ -88,8 +87,7 @@ async def test_hermes_voice_client_enables_tools_by_default(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_hermes_voice_client_sends_session_headers_and_only_new_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Session continuity + long-term memory are opt-in via headers; the gateway
-    threads the conversation so the client posts only the new user turn."""
+    """Session continuity + long-term memory are opt-in via headers; the gateway threads the conversation so the client posts only the new user turn."""
     monkeypatch.setenv("TEST_AGENT_KEY", "test-secret")
     http = _FakeHttpClient(_FakeJsonResponse({"choices": [{"message": {"content": "Lampenschirm."}}]}))
     client = HermesVoiceClient(
@@ -157,6 +155,7 @@ async def test_qwen_voice_tts_client_posts_speech_and_decodes_wav() -> None:
         "voice": "default",
         "input": "Hallo Reachy.",
         "response_format": "wav",
+        "speed": 1.0,
     }
 
 
@@ -172,9 +171,22 @@ async def test_qwen_voice_tts_client_set_voice_affects_next_payload() -> None:
     assert http.requests[0]["json"]["voice"] == "nova_de"
 
 
+def test_qwen_voice_tts_config_reads_bounded_speed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_TTS_SPEED", "0.95")
+    assert QwenVoiceTtsConfig.from_env().speed == 0.95
+
+    monkeypatch.setenv("AGENT_TTS_SPEED", "9")
+    assert QwenVoiceTtsConfig.from_env().speed == 2.0
+
+    monkeypatch.setenv("AGENT_TTS_SPEED", "0.1")
+    assert QwenVoiceTtsConfig.from_env().speed == 0.5
+
+
 @pytest.mark.asyncio
 async def test_qwen_voice_tts_client_requires_wav_response_format() -> None:
-    client = QwenVoiceTtsClient(QwenVoiceTtsConfig(response_format="mp3"), http_client=_FakeHttpClient(_FakeBytesResponse(b"")))
+    client = QwenVoiceTtsClient(
+        QwenVoiceTtsConfig(response_format="mp3"), http_client=_FakeHttpClient(_FakeBytesResponse(b""))
+    )
 
     with pytest.raises(ValueError, match="requires wav response_format"):
         await client.synthesize("Hallo.")
@@ -199,8 +211,7 @@ def _wav_bytes(*, sample_rate: int, samples: np.ndarray) -> bytes:
 
 
 def test_drain_voice_chunks_first_chunk_breaks_at_clause() -> None:
-    """First chunk ends at a clause boundary once long enough (faster first audio);
-    later chunks only at sentence end."""
+    """First chunk ends at a clause boundary once long enough (faster first audio); later chunks only at sentence end."""
     from reachy_mini_conversation_app.agent_clients import _drain_voice_chunks
 
     # First clause is long enough -> emit at the comma.
@@ -224,8 +235,7 @@ def test_drain_voice_chunks_short_leading_clause_not_split() -> None:
 
 
 def test_drain_voice_chunks_keeps_decimals_together() -> None:
-    """A period/comma between digits (42.5 / 1,5) must NOT split the number across chunks;
-    the ambiguous buffer-end punctuation is held until the next delta disambiguates."""
+    """A period/comma between digits (42.5 / 1,5) must NOT split the number across chunks; the ambiguous buffer-end punctuation is held until the next delta disambiguates."""
     from reachy_mini_conversation_app.agent_clients import _drain_voice_chunks
 
     # Buffer ends right after "42." — could be a decimal in progress -> hold, don't emit.
@@ -244,10 +254,10 @@ def test_tool_status_line_announces_slow_tools_only() -> None:
     from reachy_mini_conversation_app.agent_clients import _tool_status_line
 
     # Slow families announce (match by tool name or label).
-    assert _tool_status_line("web", '+web: "bitcoin price"') == "Moment, ich schaue im Web nach."
-    assert _tool_status_line("web_extract", None) == "Moment, ich schaue im Web nach."
-    assert _tool_status_line("terminal", None) == "Moment, ich prüfe das auf dem System."
-    assert _tool_status_line("delegation", None) == "Das größere Stück nehme ich mir im Hintergrund vor."
+    assert _tool_status_line("web", '+web: "bitcoin price"') == "One moment, I'll check the web."
+    assert _tool_status_line("web_extract", None) == "One moment, I'll check the web."
+    assert _tool_status_line("terminal", None) == "One moment, I'll check the system."
+    assert _tool_status_line("delegation", None) == "I'll handle the larger part in the background."
     # Fast / trivial tools: no announcement (would be noise, not a freeze).
     assert _tool_status_line("memory", '+memory: "note"') is None
     assert _tool_status_line("todo", None) is None
@@ -288,15 +298,14 @@ class _FakeStreamClient:
 
 @pytest.mark.asyncio
 async def test_ask_stream_announces_slow_tool_then_streams_answer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Phase A end-to-end: an inline `hermes.tool.progress` running event for a slow tool yields one
-    spoken status, the completed event is silent, and the real answer streams after."""
+    """Phase A end-to-end: an inline `hermes.tool.progress` running event for a slow tool yields one spoken status, the completed event is silent, and the real answer streams after."""
     import httpx
 
     lines = [
-        'data: {"choices":[{"delta":{}}]}',                       # initial empty chunk
-        "event: hermes.tool.progress",                           # skipped (not a data: line)
+        'data: {"choices":[{"delta":{}}]}',  # initial empty chunk
+        "event: hermes.tool.progress",  # skipped (not a data: line)
         'data: {"tool":"web","status":"running","label":"+web: q"}',
-        'data: {"tool":"web","status":"completed"}',             # completed -> no status spoken
+        'data: {"tool":"web","status":"completed"}',  # completed -> no status spoken
         'data: {"choices":[{"delta":{"content":"Das Ergebnis ist da."}}]}',
         "data: [DONE]",
     ]
@@ -306,7 +315,7 @@ async def test_ask_stream_announces_slow_tool_then_streams_answer(monkeypatch: p
 
     out = [chunk async for chunk in client.ask_stream("Was kostet Bitcoin?")]
 
-    assert out == ["Moment, ich schaue im Web nach.", "Das Ergebnis ist da."]
+    assert out == ["One moment, I'll check the web.", "Das Ergebnis ist da."]
 
 
 @pytest.mark.asyncio
@@ -338,6 +347,7 @@ class _SlowStreamResp(_FakeStreamResp):
 
     async def aiter_lines(self):  # type: ignore[no-untyped-def]
         import asyncio as _a
+
         await _a.sleep(self._delay_s)
         for ln in self._lines:
             yield ln
@@ -361,7 +371,7 @@ async def test_ask_stream_defers_when_first_audio_budget_exceeded(monkeypatch: p
 
     out = [chunk async for chunk in client.ask_stream("Mach was Langsames.")]
 
-    assert len(out) == 1 and "frag mich gleich nochmal" in out[0]
+    assert len(out) == 1 and "ask me again in a moment" in out[0]
 
 
 @pytest.mark.asyncio
@@ -410,6 +420,7 @@ async def test_fast_lead_in_client_disabled_returns_empty() -> None:
 def test_sanitize_lead_in_reduces_answer_fragment_to_bridge() -> None:
     """A disobedient 9B that starts answering must be cut to a content-free bridge."""
     from reachy_mini_conversation_app.agent_clients import _sanitize_lead_in
+
     out = _sanitize_lead_in("Der Himmel ist blau wegen Rayleigh-Streuung des Sonnenlichts")
     assert out == "Der Himmel ist blau wegen —"
     assert "Rayleigh" not in out

@@ -7,10 +7,12 @@
 3. The external-offsets seam is ADDITIVE with face tracking and actually reaches the
    composed pose (the old pending seam was clobbered every tick by _update_face_tracking).
 """
+
 from __future__ import annotations
 
 import numpy as np
 import pytest
+
 
 pytest.importorskip("reachy_mini")
 
@@ -88,9 +90,22 @@ def test_external_offsets_zero_is_behavior_neutral():
     assert np.allclose(head, np.eye(4), atol=1e-9)
 
 
+def test_quiet_idle_uses_stable_antenna_rest_offset(monkeypatch):
+    """Stationary antennas keep the small outward bias that avoids zero-position servo hunting."""
+    monkeypatch.setenv("AGENT_ANTENNA_REST_DEG", "10")
+    mgr = MovementManager(_FakeRobot())
+
+    _, antennas, _ = mgr.state.last_primary_pose
+
+    assert antennas[0] == pytest.approx(-np.deg2rad(10), abs=1e-6)
+    assert antennas[1] == pytest.approx(np.deg2rad(10), abs=1e-6)
+
+
 def test_breathing_interpolates_body_yaw_to_zero():
-    """Review 2026-07-02 round 2, P2: breathing hard-returned body_yaw=0.0 from the first tick —
-    a body SNAP after any emotion ending with body_yaw != 0. Phase 1 now blends it to 0."""
+    """Review 2026-07-02 round 2, P2: breathing hard-returned body_yaw=0.0 from the first tick — a body SNAP after any emotion ending with body_yaw != 0.
+
+    Phase 1 now blends it to 0.
+    """
     move = BreathingMove(
         interpolation_start_pose=np.eye(4, dtype=np.float32),
         interpolation_start_antennas=(0.0, 0.0),
@@ -106,10 +121,12 @@ def test_breathing_interpolates_body_yaw_to_zero():
 
 
 def test_dequeued_goto_is_rebased_onto_current_pose():
-    """Review 2026-07-02 round 2, P2: a goto queued behind a running move froze its start pose at
-    ENQUEUE time -> one-tick jump back on dequeue. The manager now re-bases it at dequeue."""
-    from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove
+    """Review 2026-07-02 round 2, P2: a goto queued behind a running move froze its start pose at ENQUEUE time -> one-tick jump back on dequeue.
+
+    The manager now re-bases it at dequeue.
+    """
     from reachy_mini_conversation_app.moves import clone_full_body_pose  # noqa: F401 (import check)
+    from reachy_mini_conversation_app.dance_emotion_moves import GotoQueueMove
 
     mgr = MovementManager(_FakeRobot())
     stale_start = np.eye(4, dtype=np.float32)
@@ -140,9 +157,10 @@ def test_dequeued_goto_is_rebased_onto_current_pose():
 
 
 def test_breathing_starts_from_last_primary_pose_not_measured():
-    """Review 2026-07-02 round 2, P3: breathing started from the MEASURED pose (which contains
-    the face-tracking offset) — the composition added the offset again = one-tick lurch toward
-    2x offset. It must start from the last COMMANDED primary pose."""
+    """Review 2026-07-02 round 2, P3: breathing started from the MEASURED pose (which contains the face-tracking offset) — the composition added the offset again = one-tick lurch toward 2x offset.
+
+    It must start from the last COMMANDED primary pose.
+    """
 
     class _OffsetRobot(_FakeRobot):
         def get_current_joint_positions(self):
@@ -164,6 +182,36 @@ def test_breathing_starts_from_last_primary_pose_not_measured():
     breathing = mgr.move_queue[0]
     assert breathing.interpolation_start_pose[0, 3] == pytest.approx(0.01, abs=1e-6)  # primary, not measured
     assert breathing.interpolation_start_body_yaw == pytest.approx(0.02, abs=1e-6)
+
+
+def test_quiet_profile_disables_idle_breathing(monkeypatch):
+    """Quiet mode holds position instead of continuously exercising head and antenna motors."""
+    monkeypatch.setenv("AGENT_IDLE_BREATHING", "0")
+    mgr = MovementManager(_FakeRobot())
+    mgr.state.last_activity_time = 0.0
+
+    mgr._manage_breathing(current_time=mgr.idle_inactivity_delay + 1.0)
+
+    assert mgr.state.current_move is None
+    assert list(mgr.move_queue) == []
+    assert mgr._breathing_active is False
+
+
+def test_listening_stops_active_idle_breathing():
+    """Microphone listening takes priority and immediately stops motor-noisy breathing."""
+    mgr = MovementManager(_FakeRobot())
+    breathing = BreathingMove(np.eye(4, dtype=np.float32), (0.0, 0.0))
+    mgr.state.current_move = breathing
+    mgr.state.move_start_time = 1.0
+    mgr.move_queue.append(BreathingMove(np.eye(4, dtype=np.float32), (0.0, 0.0)))
+    mgr._breathing_active = True
+    mgr._last_listening_toggle_time = mgr._now() - 1.0
+
+    mgr._handle_command("set_listening", True, mgr._now())
+
+    assert mgr.state.current_move is None
+    assert list(mgr.move_queue) == []
+    assert mgr._breathing_active is False
 
 
 def test_dance_emotion_error_fallback_holds_last_pose():
@@ -190,3 +238,10 @@ def test_dance_emotion_error_fallback_holds_last_pose():
     bad = move.evaluate(1.5)  # raises upstream -> must hold the last valid pose, not neutral
     assert bad[0][0, 3] == pytest.approx(0.02)
     assert bad == ok
+
+
+def test_invalid_rest_bias_falls_back_without_crashing(monkeypatch, caplog):
+    monkeypatch.setenv("AGENT_ANTENNA_REST_DEG", "invalid")
+    manager = MovementManager(_FakeRobot())
+    assert manager.state.last_primary_pose[1] == pytest.approx((-np.deg2rad(10), np.deg2rad(10)))
+    assert "Invalid AGENT_ANTENNA_REST_DEG; using 10 degrees" in caplog.text

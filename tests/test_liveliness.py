@@ -1,10 +1,10 @@
 # ruff: noqa: D103
 """Gap-map Stufe 1 (2026-07-02): idle actions, listening sync, emotion sounds, chirp library."""
-from __future__ import annotations
 
-import asyncio
+from __future__ import annotations
 import io
 import wave
+import asyncio
 
 import numpy as np
 import pytest
@@ -40,8 +40,7 @@ def test_wav_file_to_pcm_roundtrip(tmp_path):
 
 @pytest.mark.asyncio
 async def test_idle_runner_fires_only_when_idle(monkeypatch):
-    """Busy handler / recent activity must suppress actions; a quiet stretch fires exactly one
-    (cooldown suppresses the rest)."""
+    """Busy handler / recent activity must suppress actions; a quiet stretch fires exactly one (cooldown suppresses the rest)."""
     import reachy_mini_conversation_app.liveliness as lv
 
     dispatched = []
@@ -50,9 +49,7 @@ async def test_idle_runner_fires_only_when_idle(monkeypatch):
         dispatched.append(name)
         return {"status": "queued"}
 
-    monkeypatch.setattr(
-        "reachy_mini_conversation_app.tools.core_tools.dispatch_tool_call_obj", fake_dispatch
-    )
+    monkeypatch.setattr("reachy_mini_conversation_app.tools.core_tools.dispatch_tool_call_obj", fake_dispatch)
     monkeypatch.setattr(
         "reachy_mini_conversation_app.idle_policy.choose_idle_tool_call",
         lambda names, **k: ("play_emotion", {}),
@@ -96,18 +93,27 @@ def test_goto_cartoon_easing_overshoots():
     target = np.eye(4, dtype=np.float32)
     target[0, 3] = 0.02
     goto = GotoQueueMove(
-        target_head_pose=target, start_head_pose=start,
-        target_antennas=(0.0, 0.0), start_antennas=(0.0, 0.0),
-        target_body_yaw=0.0, start_body_yaw=0.0,
-        duration=1.0, interpolation="cartoon",
+        target_head_pose=target,
+        start_head_pose=start,
+        target_antennas=(0.0, 0.0),
+        start_antennas=(0.0, 0.0),
+        target_body_yaw=0.0,
+        start_body_yaw=0.0,
+        duration=1.0,
+        interpolation="cartoon",
     )
     xs = [goto.evaluate(t)[0][0, 3] for t in np.linspace(0.05, 0.98, 30)]
     assert max(xs) > 0.02 + 1e-4  # cartoon overshoots past the target, then settles
     # linear default stays monotonic (behavior-neutral)
     goto_lin = GotoQueueMove(
-        target_head_pose=target, start_head_pose=start,
-        target_antennas=(0.0, 0.0), start_antennas=(0.0, 0.0),
-        target_body_yaw=0.0, start_body_yaw=0.0, duration=1.0, interpolation="linear",
+        target_head_pose=target,
+        start_head_pose=start,
+        target_antennas=(0.0, 0.0),
+        start_antennas=(0.0, 0.0),
+        target_body_yaw=0.0,
+        start_body_yaw=0.0,
+        duration=1.0,
+        interpolation="linear",
     )
     xs_lin = [goto_lin.evaluate(t)[0][0, 3] for t in np.linspace(0.05, 0.98, 30)]
     assert max(xs_lin) <= 0.02 + 1e-9
@@ -164,6 +170,7 @@ async def test_play_emotion_routes_bundled_sound(monkeypatch, tmp_path):
 
 def test_doa_mapping():
     import math
+
     from reachy_mini_conversation_app.liveliness import map_doa_angle_to_direction
 
     assert map_doa_angle_to_direction(0.1) == "left"
@@ -208,6 +215,32 @@ async def test_speech_sway_applies_and_clears(monkeypatch):
         sway.stop()
 
 
+@pytest.mark.asyncio
+async def test_thinking_cue_is_small_slow_and_releases(monkeypatch):
+    monkeypatch.setenv("AGENT_THINKING_CUE", "1")
+    monkeypatch.setenv("AGENT_THINKING_CUE_DELAY_S", "0")
+    monkeypatch.setenv("AGENT_THINKING_CUE_MAX_DEG", "2")
+    monkeypatch.setenv("AGENT_THINKING_CUE_HZ", "1")
+    from reachy_mini_conversation_app.liveliness import ThinkingAntennaCue
+
+    calls = []
+
+    class _MM:
+        def set_external_offsets(self, offsets, antennas=(0.0, 0.0)):
+            calls.append(antennas)
+
+    cue = ThinkingAntennaCue(_MM())
+    cue.start()
+    await asyncio.sleep(0.3)
+    cue.stop()
+
+    moving = [a for a in calls if abs(a[0]) > 0.0001]
+    assert moving
+    assert all(abs(a[0]) <= np.deg2rad(2.0) + 1e-9 for a in moving)
+    assert all(abs(a[0] + a[1]) < 1e-9 for a in moving)
+    assert calls[-1] == (0.0, 0.0)
+
+
 def test_imu_magnitude_extraction():
     from reachy_mini_conversation_app.liveliness import ImuWatcher
 
@@ -223,14 +256,13 @@ def test_imu_magnitude_extraction():
 
 @pytest.mark.asyncio
 async def test_play_wav_path_non_wav_falls_back_to_daemon(monkeypatch):
-    """A non-WAV emotion sound (e.g. .ogg) must route through the daemon sound library instead
-    of being dropped when wav_file_to_pcm can't read it."""
+    """A non-WAV emotion sound (e.g. .ogg) must route through the daemon sound library instead of being dropped when wav_file_to_pcm can't read it."""
+    from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.agent_voice_handler import (
         AgentVoiceHandler,
         FakeAudioTtsClient,
         FakeTextAgentClient,
     )
-    from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 
     handler = AgentVoiceHandler(
         ToolDependencies(reachy_mini=object(), movement_manager=None),
@@ -260,10 +292,10 @@ async def test_play_wav_path_non_wav_falls_back_to_daemon(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_idle_runner_reaches_real_dispatcher(monkeypatch):
-    """Regression: IdleActionRunner must call the dispatcher with the (name, args, deps) shape
-    that the real core_tools dispatcher expects — a stub with the wrong argument order can stay
-    green while every idle action dies with a TypeError at runtime. This one routes a sentinel
-    tool through the REAL core_tools dispatcher."""
+    """Regression: IdleActionRunner must call the dispatcher with the (name, args, deps) shape that the real core_tools dispatcher expects — a stub with the wrong argument order can stay green while every idle action dies with a TypeError at runtime.
+
+    This one routes a sentinel tool through the REAL core_tools dispatcher.
+    """
     import reachy_mini_conversation_app.tools.core_tools as core_tools
 
     core_tools.initialize_tools()
@@ -284,9 +316,7 @@ async def test_idle_runner_reaches_real_dispatcher(monkeypatch):
         movement_manager = None
 
     deps = _Deps()
-    runner = IdleActionRunner(
-        deps, is_busy=lambda: False, idle_after_s=0.01, cooldown_s=10.0, check_interval_s=0.02
-    )
+    runner = IdleActionRunner(deps, is_busy=lambda: False, idle_after_s=0.01, cooldown_s=10.0, check_interval_s=0.02)
     runner.start()
     await asyncio.sleep(0.15)
     runner.stop()
@@ -306,3 +336,135 @@ async def test_dispatch_tool_call_obj_unknown_tool():
 
     result = await dispatch_tool_call_obj("definitely_not_a_tool", {"x": 1}, _Deps())
     assert result == {"error": "unknown tool: definitely_not_a_tool"}
+
+
+@pytest.mark.asyncio
+async def test_thinking_stop_does_not_overwrite_sway(monkeypatch):
+    """An idle or delayed cue must never clear another writer's antenna offset."""
+    from unittest.mock import MagicMock
+
+    from reachy_mini_conversation_app.liveliness import ThinkingAntennaCue
+
+    monkeypatch.setenv("AGENT_THINKING_CUE_DELAY_S", "0.2")
+    monkeypatch.setenv("AGENT_THINKING_CUE", "1")
+    mm = MagicMock()
+    cue = ThinkingAntennaCue(mm)
+    cue.stop()
+    mm.set_external_offsets.assert_not_called()
+    cue.start()
+    await asyncio.sleep(0.02)
+    mm.set_external_offsets.assert_not_called()
+    cue.stop()
+    await asyncio.sleep(0)
+    mm.set_external_offsets.assert_not_called()
+    cue._apply(0.03)
+    cue.stop()
+    assert mm.set_external_offsets.call_args.kwargs["antennas"] == (0.0, 0.0)
+    assert not cue._applied
+    mm.set_external_offsets.reset_mock()
+    cue.stop()
+    mm.set_external_offsets.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_thinking_cancellation_releases_applied_offset(monkeypatch):
+    """Cancellation clears an active cue exactly once, before another writer takes over."""
+    from unittest.mock import MagicMock
+
+    from reachy_mini_conversation_app.liveliness import ThinkingAntennaCue
+
+    monkeypatch.setenv("AGENT_THINKING_CUE_DELAY_S", "0")
+    monkeypatch.setenv("AGENT_THINKING_CUE", "1")
+    cue = ThinkingAntennaCue(MagicMock())
+    cue.start()
+    await asyncio.sleep(0.08)
+    assert cue._applied
+    task = cue._task
+    task.cancel()
+    await task
+    assert not cue._applied
+    assert cue.mm.set_external_offsets.call_args.kwargs["antennas"] == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("value,thinking,sway", [("999", 5, 14), ("-9", 0, 0), ("2", 2, 2)])
+def test_antenna_amplitude_bounds(monkeypatch, value, thinking, sway):
+    """Clamp cue and sway amplitudes without increasing their existing defaults."""
+    from reachy_mini_conversation_app.liveliness import SpeechSway, ThinkingAntennaCue
+
+    monkeypatch.setenv("AGENT_THINKING_CUE_MAX_DEG", value)
+    monkeypatch.setenv("AGENT_SWAY_MAX_DEG", value)
+    assert ThinkingAntennaCue(None).max_rad == pytest.approx(np.deg2rad(thinking))
+    assert SpeechSway(None).max_rad == pytest.approx(np.deg2rad(sway))
+
+
+@pytest.mark.parametrize(
+    "text,intent",
+    [
+        ("Hello", "greeting"),
+        ("Goodbye", "goodbye"),
+        ("Bye", "goodbye"),
+        ("Thanks", "grateful"),
+        ("Thank you", "grateful"),
+        ("Sorry", "downcast"),
+        ("Unfortunately", "downcast"),
+        ("Great", "success"),
+        ("Done", "success"),
+        ("Awesome", "success"),
+        ("Careful", "anxious"),
+        ("Watch out", "anxious"),
+        ("That's hilarious", "laughing"),
+        ("Incredible", "amazed"),
+        ("Unclear", "confused"),
+        ("Yes.", "yes"),
+        ("No.", "no"),
+        ("Danke", "grateful"),
+        ("Vorsicht", "anxious"),
+    ],
+)
+def test_emotion_cues_support_english_and_german(text, intent):
+    """English cues mirror the existing German intents without removing German support."""
+    from reachy_mini_conversation_app.emotion_cues import emotion_for_turn
+
+    assert emotion_for_turn("", text) == intent
+
+
+@pytest.mark.parametrize(
+    "user,answer,expected",
+    [
+        ("Tell me about the Great Wall.", "It is a historic wall.", None),
+        ("Are you done?", "Not yet", None),
+        ("Is it dangerous?", "It's safe.", None),
+        ("", "Great question! Let me explain.", None),
+        ("", "Once it's done, restart", None),
+        ("", "Nothing done yet", None),
+        ("", "No. 5 is the answer.", None),
+        ("", "Hi-fi sound is clear.", None),
+        ("Thank you", "You're welcome", "grateful"),
+        ("", "You’re welcome", "grateful"),
+        ("", "I don’t understand", "confused"),
+        ("", "Great!", "success"),
+        ("", "Done.", "success"),
+        ("", "Fertig!", "success"),
+        ("", "Noch nicht fertig.", None),
+        ("", "Wenn es fertig ist, starte neu.", None),
+        ("", "Der Kuchen ist in 20 Minuten fertig.", None),
+        ("", "No. That's not right.", "no"),
+        ("", "Nein. Das geht nicht.", "no"),
+        ("", "Tatsächlich?", "amazed"),
+        ("", "No.", "no"),
+    ],
+)
+def test_emotes_follow_answer_intent(user, answer, expected):
+    """User questions and incidental wording must not trigger answer-side affect."""
+    from reachy_mini_conversation_app.emotion_cues import emotion_for_turn
+
+    assert emotion_for_turn(user, answer) == expected
+
+
+@pytest.mark.parametrize("value,expected", [("0", 0.05), ("-1", 0.05), ("99", 1.0), ("0.18", 0.18)])
+def test_thinking_frequency_is_bounded(monkeypatch, value, expected):
+    """Keep thinking cues within a slow, bounded frequency range."""
+    from reachy_mini_conversation_app.liveliness import ThinkingAntennaCue
+
+    monkeypatch.setenv("AGENT_THINKING_CUE_HZ", value)
+    assert ThinkingAntennaCue(None).frequency_hz == expected

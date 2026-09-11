@@ -9,14 +9,14 @@ The tests drive handle_final_transcript with fake streaming clients and simulate
 endpointing by calling _classify_and_act from inside the fake TTS. The gate runs for real via its
 pure heuristic ("ja" -> ignore, "stopp" -> stop); the commit case monkeypatches the classifier.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import asyncio
 
 import numpy as np
 import pytest
-
 import reachy_agent.voice.semantic_gate as gate
+
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.agent_voice_handler import AgentVoiceHandler
 
@@ -46,8 +46,7 @@ class _StreamAgentClient:
 
 
 class _ActingTtsClient:
-    """Streams a chunk per sentence; on the configured sentence index, simulates a completed user
-    utterance by invoking the handler's _classify_and_act (what _feed_barge does on an endpoint)."""
+    """Streams a chunk per sentence; on the configured sentence index, simulates a completed user utterance by invoking the handler's _classify_and_act (what _feed_barge does on an endpoint)."""
 
     def __init__(self, box: dict, *, act_on_call: int, transcript: str) -> None:
         self.box = box
@@ -86,10 +85,11 @@ async def test_backchannel_is_ignored_agent_keeps_talking() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bare_stop_stops_without_forward() -> None:
+@pytest.mark.parametrize("stop_text", ["stopp", "stop", "no", "wait", "shh"])
+async def test_bare_stop_stops_without_forward(stop_text) -> None:
     box: dict = {}
     agent = _StreamAgentClient(["Satz eins.", "Satz zwei.", "Satz drei."])
-    tts = _ActingTtsClient(box, act_on_call=0, transcript="stopp")  # heuristic -> stop
+    tts = _ActingTtsClient(box, act_on_call=0, transcript=stop_text)  # heuristic -> stop
     handler = _make_handler(agent, tts)
     box["h"] = handler
     handler._turn_active = True  # receive() sets this before scheduling the turn
@@ -98,9 +98,9 @@ async def test_bare_stop_stops_without_forward() -> None:
     for _ in range(4):
         await asyncio.sleep(0)
 
-    assert tts.calls == ["Satz eins."]                # stopped after the first sentence
-    assert handler._pending_barge is None             # bare stop forwards nothing
-    assert handler._turn_active is False              # no follow-up turn
+    assert tts.calls == ["Satz eins."]  # stopped after the first sentence
+    assert handler._pending_barge is None  # bare stop forwards nothing
+    assert handler._turn_active is False  # no follow-up turn
     assert agent.calls == ["Erzähl mir was"]
 
 
@@ -118,7 +118,7 @@ async def test_commit_stops_and_forwards_whole_transcript(monkeypatch) -> None:
     for _ in range(6):
         await asyncio.sleep(0)
 
-    assert tts.calls[0] == "Satz eins."                                 # first reply started
+    assert tts.calls[0] == "Satz eins."  # first reply started
     # the committed interrupt becomes a SECOND turn, forwarded whole:
     assert agent.calls == ["Erzähl mir was", "hör auf, erzähl mir über Katzen"]
 
@@ -142,8 +142,7 @@ class _PlatformishClient(_StreamAgentClient):
 
 @pytest.mark.asyncio
 async def test_classify_dispatches_platform_interrupt_immediately(monkeypatch) -> None:
-    """P1-5 (review 2026-07-02 round 2): a stop/commit decided during the gateway's silent
-    tool/think phase must reach the gateway NOW — not at the next spoken sentence."""
+    """P1-5 (review 2026-07-02 round 2): a stop/commit decided during the gateway's silent tool/think phase must reach the gateway NOW — not at the next spoken sentence."""
     monkeypatch.setattr(gate, "classify_interrupt", lambda *_a, **_k: "commit")
     client = _PlatformishClient([])
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
@@ -152,18 +151,19 @@ async def test_classify_dispatches_platform_interrupt_immediately(monkeypatch) -
     await handler._classify_and_act("stopp, erzähl lieber über Katzen")
 
     assert client.interrupts == ["stopp, erzähl lieber über Katzen"]  # dispatched immediately
-    assert handler._pending_barge is None      # consumed by the dispatch (no duplicate turn)
+    assert handler._pending_barge is None  # consumed by the dispatch (no duplicate turn)
     assert handler._barge_event.is_set() is False  # state reset -> speak loop keeps streaming
     assert handler._classify_inflight is False
 
 
 @pytest.mark.asyncio
-async def test_classify_bare_stop_dispatches_slash_stop(monkeypatch) -> None:
+@pytest.mark.parametrize("stop_text", ["stopp", "stop", "no", "wait", "shh"])
+async def test_classify_bare_stop_dispatches_slash_stop(monkeypatch, stop_text) -> None:
     client = _PlatformishClient([])
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
     handler._turn_active = True
 
-    await handler._classify_and_act("stopp")  # heuristic bare stop
+    await handler._classify_and_act(stop_text)  # runtime heuristic, no LLM mock
 
     assert client.interrupts == [None]  # forwarded as bare /stop by the client
     assert handler._barge_event.is_set() is False
@@ -171,8 +171,7 @@ async def test_classify_bare_stop_dispatches_slash_stop(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_classify_http_transport_keeps_loop_side_path(monkeypatch) -> None:
-    """No interrupt() on the client (HTTP): the event must STAY set so the speak loop handles
-    the barge at the next sentence, exactly as before."""
+    """No interrupt() on the client (HTTP): the event must STAY set so the speak loop handles the barge at the next sentence, exactly as before."""
     monkeypatch.setattr(gate, "classify_interrupt", lambda *_a, **_k: "commit")
     client = _StreamAgentClient([])  # no interrupt attr
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
@@ -186,16 +185,14 @@ async def test_classify_http_transport_keeps_loop_side_path(monkeypatch) -> None
 
 @pytest.mark.asyncio
 async def test_silent_phase_commit_is_deferred_and_fires_at_first_audio(monkeypatch) -> None:
-    """Review 2026-07-02 round 2, P2: a commit during the silent think phase must not vanish —
-    it defers via _pending_barge and executes at the first queued audio."""
+    """Review 2026-07-02 round 2, P2: a commit during the silent think phase must not vanish — it defers via _pending_barge and executes at the first queued audio."""
     monkeypatch.setattr(gate, "classify_interrupt", lambda *_a, **_k: "commit")
     client = _PlatformishClient([])
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
     handler._turn_active = True
     handler._turn_spoke = False  # silent think phase
 
-    await handler._classify_and_act("nein warte, nimm die andere Datei",
-                                    my_seq=handler._turn_seq, silent_phase=True)
+    await handler._classify_and_act("nein warte, nimm die andere Datei", my_seq=handler._turn_seq, silent_phase=True)
 
     # deferred: nothing stopped/dispatched yet, command parked
     assert handler._pending_barge == "nein warte, nimm die andere Datei"
@@ -212,13 +209,14 @@ async def test_silent_phase_commit_is_deferred_and_fires_at_first_audio(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_silent_phase_bare_stop_lets_turn_deliver(monkeypatch) -> None:
+@pytest.mark.parametrize("stop_text", ["stopp", "stop", "no", "wait", "shh"])
+async def test_silent_phase_bare_stop_lets_turn_deliver(monkeypatch, stop_text) -> None:
     client = _PlatformishClient([])
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
     handler._turn_active = True
     handler._turn_spoke = False
 
-    await handler._classify_and_act("stopp", my_seq=handler._turn_seq, silent_phase=True)
+    await handler._classify_and_act(stop_text, my_seq=handler._turn_seq, silent_phase=True)
 
     # nothing audible to stop -> no cancel (no-answer-loop protection), nothing forwarded
     assert handler._pending_barge is None
@@ -228,8 +226,7 @@ async def test_silent_phase_bare_stop_lets_turn_deliver(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_stale_classify_after_turn_end_is_dropped(monkeypatch) -> None:
-    """Review 2026-07-02 round 2, P2: a gate decision arriving after its turn ended (turn_seq
-    rolled) must neither stop the NEXT turn nor linger as a ghost _pending_barge."""
+    """Review 2026-07-02 round 2, P2: a gate decision arriving after its turn ended (turn_seq rolled) must neither stop the NEXT turn nor linger as a ghost _pending_barge."""
     monkeypatch.setattr(gate, "classify_interrupt", lambda *_a, **_k: "commit")
     client = _PlatformishClient([])
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
@@ -247,9 +244,10 @@ async def test_stale_classify_after_turn_end_is_dropped(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_chirp_books_playback_clock_without_turn_spoke(monkeypatch) -> None:
-    """Review 2026-07-02 round 2, P3: the chirp bumped only _speaking_until; the next speech
-    segment restarted the cursor at `now` -> tail mute ended ~a chirp too early. Booking it via
-    the clock must NOT set _turn_spoke or fire a deferred commit."""
+    """Review 2026-07-02 round 2, P3: the chirp bumped only _speaking_until; the next speech segment restarted the cursor at `now` -> tail mute ended ~a chirp too early.
+
+    Booking it via the clock must NOT set _turn_spoke or fire a deferred commit.
+    """
     monkeypatch.setenv("AGENT_CHIRPS", "1")
     client = _PlatformishClient([])
     handler = _make_handler(client, _ActingTtsClient({}, act_on_call=-1, transcript=""))
@@ -258,9 +256,10 @@ async def test_chirp_books_playback_clock_without_turn_spoke(monkeypatch) -> Non
     handler._pending_barge = "deferred kommando"  # must NOT fire on a chirp
 
     import time as _t
+
     before = _t.monotonic()
     handler._status_chirp("acknowledge")
-    assert handler._playback_cursor > before          # cue is on the playback clock
-    assert handler._turn_spoke is False               # a cue is not spoken content
-    assert handler._barge_event.is_set() is False     # deferred commit NOT fired
+    assert handler._playback_cursor > before  # cue is on the playback clock
+    assert handler._turn_spoke is False  # a cue is not spoken content
+    assert handler._barge_event.is_set() is False  # deferred commit NOT fired
     assert client.interrupts == []
