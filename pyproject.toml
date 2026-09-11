@@ -20,6 +20,7 @@ dependencies = [
     "gradio==5.50.1.dev1",
     "huggingface-hub==1.21.0",  # was 1.19.0; installed 1.21.0
     "httpx>=0.28.1",
+    "websockets>=13,<16",
 
     #Environment variables
     "python-dotenv",

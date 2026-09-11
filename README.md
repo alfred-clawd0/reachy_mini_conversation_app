@@ -523,5 +523,6 @@ default to English, including scene/VLM prompts, fallbacks, and semantic-gate pr
 bare stops such as "no", "wait", and "shh" are handled alongside German stops. The runtime
 uses only its `[voice]` extra here; update the pin to the fork's main merge commit after its PR merges.
 An explicit adapter `hello_ok` acknowledgement is still deferred. An inbound application frame
-or a connection that remains open for 10 seconds after hello resets the authentication retry streak.
+or a connection that remains open for 12 seconds after hello resets the authentication retry streak.
+This includes a two-second margin over the adapter's 10-second hello deadline.
 Protocol DEBUG logging is suppressed by the client itself, including after logging reconfiguration.

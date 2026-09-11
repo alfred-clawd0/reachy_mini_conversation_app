@@ -1054,7 +1054,8 @@ async def test_supervisor_reloads_credentials_on_schedule(monkeypatch, tmp_path)
         connects.append(now[0])
         return FakeWS([])
 
-    monkeypatch.setattr(platform.asyncio, "sleep", sleep)
+    monkeypatch.setattr(platform, "_sleep", sleep)
+    assert asyncio.sleep is original_sleep  # background tasks retain the real event-loop clock
     monkeypatch.setattr(wac, "connect", connect)
     try:
         await client._supervise()

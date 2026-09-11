@@ -2401,6 +2401,7 @@ dependencies = [
     { name = "reachy-mini", extra = ["mujoco"] },
     { name = "reachy-mini-dances-library" },
     { name = "reachy-mini-toolbox" },
+    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -2472,6 +2473,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'local-vision'", specifier = "==5.3.0" },
     { name = "ultralytics", marker = "extra == 'all-vision'" },
     { name = "ultralytics", marker = "extra == 'yolo-vision'" },
+    { name = "websockets", specifier = ">=13,<16" },
 ]
 provides-extras = ["gemini", "local-vision", "yolo-vision", "mediapipe-vision", "voice", "all-vision"]
 

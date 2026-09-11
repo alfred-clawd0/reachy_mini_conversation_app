@@ -53,7 +53,10 @@ from reachy_mini_conversation_app.agent_clients import (
 
 logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
-_AUTH_GRACE_S = 10.0
+_sleep = asyncio.sleep
+# The adapter rejects bad keys on hello and enforces HELLO_TIMEOUT_S = 10.0.
+# Allow a two-second margin before treating an open, silent session as healthy.
+_AUTH_GRACE_S = 12.0
 
 
 class _ProtocolLogger(logging.LoggerAdapter[logging.Logger]):
@@ -284,13 +287,13 @@ class ReachyPlatformClient:
                     if self._superseded:
                         return
                     if self._auth_retry_at > _monotonic():
-                        await asyncio.sleep(min(1.0, self._auth_retry_at - _monotonic()))
+                        await _sleep(min(1.0, self._auth_retry_at - _monotonic()))
                         continue
                     logger.info("[reachy-platform] reconnect failed (%s) — retry in %.0fs", e, backoff)
-                    await asyncio.sleep(backoff)
+                    await _sleep(backoff)
                     backoff = min(backoff * 2.0, 30.0)
                     continue
-            await asyncio.sleep(1.0)
+            await _sleep(1.0)
 
     def set_proactive_handler(self, handler: ProactiveHandler | None) -> None:
         """Register the async callback that speaks proactively-delivered text."""
