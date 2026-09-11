@@ -415,7 +415,7 @@ class ThinkingAntennaCue:
         self.mm = movement_manager
         self.delay_s = _env_float("AGENT_THINKING_CUE_DELAY_S", 0.8)
         self.max_rad = float(np.deg2rad(min(5.0, max(0.0, _env_float("AGENT_THINKING_CUE_MAX_DEG", 2.0)))))
-        self.frequency_hz = _env_float("AGENT_THINKING_CUE_HZ", 0.18)
+        self.frequency_hz = min(1.0, max(0.05, _env_float("AGENT_THINKING_CUE_HZ", 0.18)))
         self._task: asyncio.Task[Any] | None = None
         self._applied = False
 

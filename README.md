@@ -151,7 +151,7 @@ Copy `.env.example` to `.env` when you want to switch backends, provide API keys
 | `AGENT_IDLE_BREATHING` / `AGENT_IDLE_ACTIONS` | Idle breathing and random idle movement. Both default to `1` (on); set `0` for quiet microphone operation. |
 | `AGENT_SPEECH_WOBBLE` / `AGENT_SPEECH_SWAY` | Speech-driven head wobble and antenna sway. Both default to `1` (on); set `0` to disable. |
 | `AGENT_TURN_EMOTES` / `AGENT_ORIENT_TO_SPEAKER` | End-of-turn emotions and microphone-triggered head turns. Both default to `1` (on); set `0` to disable. |
-| `AGENT_THINKING_CUE` / `AGENT_THINKING_CUE_MAX_DEG` | Subtle antenna-only cue while waiting for the backend, and its amplitude. Defaults to `1` (on) and `2.0` degrees; amplitude is clamped to `0`–`5` degrees. |
+| `AGENT_THINKING_CUE` / `AGENT_THINKING_CUE_MAX_DEG` | Subtle antenna-only cue while waiting for the backend, and its amplitude. Defaults to `1` (on) and `2.0` degrees; amplitude is clamped to `0`–`5` degrees. `AGENT_THINKING_CUE_HZ` is clamped to `0.05`–`1` Hz. |
 | `AGENT_SWAY_MAX_DEG` | Speech-sway amplitude, default `14` degrees, clamped to `0`–`14`. |
 | `AGENT_ANTENNA_REST_DEG` | Initial outward antenna rest bias. Defaults to `10` (clamped to `0`–`20`; malformed values warn and fall back to `10`). This seeds only the initial pose: later moves can end at zero antennas, and quiet mode does not restore the bias. |
 | `AGENT_DAEMON_BASE_URL` | Reachy daemon HTTP API for playback/movement/status. Defaults to `http://127.0.0.1:8000`. |
@@ -514,5 +514,6 @@ The app and the pinned [English runtime](https://github.com/alfred-clawd0/reachy
 default to English, including scene/VLM prompts, fallbacks, and semantic-gate prompts. English
 bare stops such as "no", "wait", and "shh" are handled alongside German stops. The runtime
 uses only its `[voice]` extra here; update the pin to the fork's main merge commit after its PR merges.
-An explicit adapter `hello_ok` acknowledgement is also deferred; currently an inbound application
-frame resets the authentication retry streak.
+An explicit adapter `hello_ok` acknowledgement is still deferred. An inbound application frame
+or a connection that remains open for 10 seconds after hello resets the authentication retry streak.
+Protocol DEBUG logging is suppressed by the client itself, including after logging reconfiguration.

@@ -426,3 +426,40 @@ def test_emotion_cues_support_english_and_german(text, intent):
     from reachy_mini_conversation_app.emotion_cues import emotion_for_turn
 
     assert emotion_for_turn("", text) == intent
+
+
+@pytest.mark.parametrize(
+    "user,answer,expected",
+    [
+        ("Tell me about the Great Wall.", "It is a historic wall.", None),
+        ("Are you done?", "Not yet", None),
+        ("Is it dangerous?", "It's safe.", None),
+        ("", "Great question! Let me explain.", None),
+        ("", "Once it's done, restart", None),
+        ("", "Nothing done yet", None),
+        ("", "No. 5 is the answer.", None),
+        ("", "Hi-fi sound is clear.", None),
+        ("Thank you", "You're welcome", "grateful"),
+        ("", "You’re welcome", "grateful"),
+        ("", "I don’t understand", "confused"),
+        ("", "Great!", "success"),
+        ("", "Done.", "success"),
+        ("", "Fertig!", "success"),
+        ("", "Tatsächlich?", "amazed"),
+        ("", "No.", "no"),
+    ],
+)
+def test_emotes_follow_answer_intent(user, answer, expected):
+    """User questions and incidental wording must not trigger answer-side affect."""
+    from reachy_mini_conversation_app.emotion_cues import emotion_for_turn
+
+    assert emotion_for_turn(user, answer) == expected
+
+
+@pytest.mark.parametrize("value,expected", [("0", 0.05), ("-1", 0.05), ("99", 1.0), ("0.18", 0.18)])
+def test_thinking_frequency_is_bounded(monkeypatch, value, expected):
+    """Keep thinking cues within a slow, bounded frequency range."""
+    from reachy_mini_conversation_app.liveliness import ThinkingAntennaCue
+
+    monkeypatch.setenv("AGENT_THINKING_CUE_HZ", value)
+    assert ThinkingAntennaCue(None).frequency_hz == expected

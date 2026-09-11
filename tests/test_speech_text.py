@@ -28,16 +28,16 @@ def test_normalize_for_speech_preserves_plain_conversation() -> None:
 @pytest.mark.parametrize(
     "text,expected",
     [
-        ("-5°C tonight.", "-5 degrees Celsius tonight."),
-        ("-3% on the day.", "-3 percent on the day."),
+        ("-5°C tonight.", "minus 5 degrees Celsius tonight."),
+        ("-3% on the day.", "minus 3 percent on the day."),
         ("−5°C tonight.", "minus 5 degrees Celsius tonight."),
         ("- Intro -", "Intro"),
         ("Visit www.example.com.", "Visit the link."),
         ("Visit https://example.com/search?q=weather&units=c.", "Visit the link."),
         ("(https://example.com/path).", "(the link)."),
-        ("Open /Users/me/notes.txt.", "Open a file path."),
-        ("Open /tmp/report.csv.", "Open a file path."),
-        ("Open /private/var/report.csv.", "Open a file path."),
+        ("Open /Users/me/notes.txt.", "Open notes.txt."),
+        ("Open /tmp/report.csv.", "Open report.csv."),
+        ("Open /private/var/report.csv.", "Open report.csv."),
         ("Open /Users/me/Tools/Editor.app/Contents/MacOS.", "Open the application."),
         ("5 * 3 = 15.", "5 * 3 = 15."),
         ("This is **bold** and *emphasized*.", "This is bold and emphasized."),
@@ -46,4 +46,26 @@ def test_normalize_for_speech_preserves_plain_conversation() -> None:
 )
 def test_normalization_preserves_meaning(text, expected):
     """Preserve numerical signs, arithmetic, punctuation, and the kind of path."""
+    assert normalize_for_speech(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("10−5=5", "10 minus 5=5"),
+        ("It is -5 today.", "It is minus 5 today."),
+        ("5-10 on 2026-09-11, score 3-2.", "5-10 on 2026-09-11, score 3-2."),
+        ("Open /Applications/Google Chrome.app.", "Open the application."),
+        ("Open /Applications/Google Chrome.app/Contents/MacOS.", "Open the application."),
+        ("Saved to /tmp/output/", "Saved to output"),
+        ("Open /tmp/this_filename_is_much_too_long_to_pronounce.json.", "Open a file."),
+        ("1. First\n2. Second", "First, Second"),
+        ("***bold italic***", "bold italic"),
+        ("Price*", "Price*"),
+        ("__init__", "__init__"),
+        ("__important words__", "important words"),
+    ],
+)
+def test_speech_wording_and_symbols(text, expected):
+    """Keep identifiers and numeric separators while making prose and paths speakable."""
     assert normalize_for_speech(text) == expected
